@@ -252,3 +252,48 @@ test('pullImages downloads PwnDoc image ids into the folder and rewrites them to
     await T.pullImages(ctx, `![Fig 1](${ID})`, 'attachments'); // second pull: already there
     assert.equal(Object.keys(written).length, 1);
 });
+
+// ── diff / comparison ─────────────────────────────────────────────────────────
+test('lineDiff marks equal, deleted and added lines', () => {
+    assert.deepEqual(T.lineDiff('a\nb', 'a\nc'), [
+        { op: 'eq', line: 'a' }, { op: 'del', line: 'b' }, { op: 'add', line: 'c' }]);
+    assert.deepEqual(T.lineDiff('x', 'x').map(d => d.op), ['eq']);
+    assert.deepEqual(T.lineDiff('', 'a').map(d => d.op), ['add']);
+    assert.deepEqual(T.lineDiff('a', '').map(d => d.op), ['del']);
+});
+
+const cmpCtx = {
+    normalize: async md => md.trim(),
+    htmlToMd: html => html.replace(/<[^>]+>/g, '').trim(),
+    cfLabels: {},
+};
+const FINDING = {
+    description: '<p>remote desc</p>', observation: '<p>remote obs</p>', poc: '<p>remote poc</p>',
+    scope: 'a1', remediation: '<p>rem</p>', references: ['http://x', 'http://y'], customFields: [],
+};
+
+test('buildComparison: a note with only Evidenza filled differs on poc and flags the empty local sections', async () => {
+    const note = '## Descrizione\n\n\n## Impatto\n\n\n## Evidenza\n\nlocal poc\n\n## Assets\n\n\n## Remediation\n\n\n';
+    const rows = await T.buildComparison(cmpCtx, note, FINDING, ['description', 'poc', 'scope']);
+    const by = Object.fromEntries(rows.map(r => [r.key, r]));
+    assert.equal(by.poc.changed, true);
+    assert.equal(by.poc.local, 'local poc');
+    assert.equal(by.poc.remote, 'remote poc');
+    assert.equal(by.description.localEmpty, true);
+    assert.equal(by.description.remoteEmpty, false);
+    assert.equal(by.scope.localEmpty, true);
+});
+
+test('buildComparison: identical content after normalisation is not changed; references compare as a list', async () => {
+    const note = '## Evidenza\n\nremote poc\n\n## References\n\n- http://x\n- http://y\n';
+    const rows = await T.buildComparison(cmpCtx, note, FINDING, ['poc', 'references']);
+    assert.equal(rows.find(r => r.key === 'poc').changed, false);
+    assert.equal(rows.find(r => r.key === 'references').changed, false);
+});
+
+test('buildComparison: a missing PoC on PwnDoc (remote empty) is flagged', async () => {
+    const note = '## Evidenza\n\nlocal poc\n';
+    const rows = await T.buildComparison(cmpCtx, note, { ...FINDING, poc: '' }, ['poc']);
+    assert.equal(rows[0].remoteEmpty, true);
+    assert.equal(rows[0].changed, true);
+});

@@ -330,6 +330,67 @@ async function pullImages(ctx, md, destFolder) {
     return replaceImageRefs(md, r => (paths.has(r.src) ? `![${r.alt}](${encodeURI(paths.get(r.src))})` : r.raw));
 }
 
+// ── Diff / comparison ─────────────────────────────────────────────────────────
+// Line-level LCS diff. ponytail: O(n*m) table, fine for note sections, use a Myers diff for huge ones
+function lineDiff(a, b) {
+    const x = a === '' ? [] : a.split('\n');
+    const y = b === '' ? [] : b.split('\n');
+    const lcs = Array.from({ length: x.length + 1 }, () => new Array(y.length + 1).fill(0));
+    for (let i = x.length - 1; i >= 0; i--) {
+        for (let j = y.length - 1; j >= 0; j--) {
+            lcs[i][j] = x[i] === y[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+        }
+    }
+    const out = [];
+    let i = 0, j = 0;
+    while (i < x.length && j < y.length) {
+        if (x[i] === y[j]) { out.push({ op: 'eq', line: x[i] }); i++; j++; }
+        else if (lcs[i + 1][j] >= lcs[i][j + 1]) out.push({ op: 'del', line: x[i++] });
+        else out.push({ op: 'add', line: y[j++] });
+    }
+    while (i < x.length) out.push({ op: 'del', line: x[i++] });
+    while (j < y.length) out.push({ op: 'add', line: y[j++] });
+    return out;
+}
+
+// Custom fields rendered the way createVulnNote writes them: **label** + value, empty ones omitted
+function renderCustomFields(finding, ctx) {
+    return (finding.customFields || [])
+        .map(cf => ({ label: ctx.cfLabels?.[cf.customField?._id || cf.customField] || cf.customField?.label || '', value: ctx.htmlToMd(cf.text || '') }))
+        .filter(c => c.label && c.value)
+        .flatMap(c => [`**${c.label}**`, '', c.value, ''])
+        .join('\n').trim();
+}
+
+const listLines = text => text.split(/\n|; /).map(l => l.replace(/^\s*[-*]\s+/, '').trim()).filter(Boolean).join('\n');
+
+// ctx: { normalize(md) -> Promise<string>, htmlToMd(html) -> string, cfLabels }
+// One row per requested section: local and remote in comparison form, plus emptiness flags used to guard overwrites
+async function buildComparison(ctx, noteMd, finding, keys) {
+    const secs = parseSections(noteMd);
+    const rows = [];
+    for (const key of keys) {
+        const def = SECTION_DEFS.find(d => d.key === key);
+        const localRaw = secs[key]?.text || '';
+        let local, remote;
+        if (def.kind === 'html') {
+            local = await ctx.normalize(localRaw);
+            remote = await ctx.normalize(ctx.htmlToMd(finding[def.field] || ''));
+        } else if (def.kind === 'list') {
+            local = listLines(localRaw);
+            remote = (finding[def.field] || []).map(s => s.trim()).filter(Boolean).join('\n');
+        } else if (def.kind === 'custom') {
+            local = localRaw.trim();
+            remote = renderCustomFields(finding, ctx);
+        } else {
+            local = localRaw.trim();
+            remote = String(finding[def.field] || '').trim();
+        }
+        rows.push({ key, local, remote, changed: local !== remote, localEmpty: local === '', remoteEmpty: remote === '', diff: lineDiff(remote, local) });
+    }
+    return rows;
+}
+
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
 async function readFilePath(app, filePath) {
     if (/^([A-Za-z]:[\\/]|\/)/.test(filePath)) {
@@ -1443,4 +1504,5 @@ class PwnDocImporterPlugin extends Plugin {
 
 module.exports = PwnDocImporterPlugin;
 module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
-    extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages };
+    extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
+    lineDiff, buildComparison, renderCustomFields };
