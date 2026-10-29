@@ -87,7 +87,7 @@ function computeCVSS31(vector) {
 // value a pull writes (undefined = leave as is)
 const STATUS_DONE = 0, STATUS_OPEN = 1; // finding.status in PwnDoc: 0 completed, 1 in progress
 const enumCodec = names => ({
-    cmpLocal: raw => { const n = Number(raw); return raw !== '' && raw != null && n >= 1 && n <= names.length ? names[n - 1] : String(raw ?? '').trim().toLowerCase(); },
+    cmpLocal: raw => { const n = Number(raw); return raw !== '' && raw != null && Number.isInteger(n) && n >= 1 && n <= names.length ? names[n - 1] : String(raw ?? '').trim().toLowerCase(); },
     cmpRemote: v => names[v - 1] ?? '',
     toRemote: cmp => { const i = names.indexOf(cmp); return i >= 0 ? i + 1 : undefined; },
     toFm: cmp => cmp || undefined,
@@ -496,6 +496,7 @@ const defOf = key => SECTION_DEFS.find(d => d.key === key);
 
 async function localToRemote(ctx, auditId, def, text, fresh) {
     if (def.toRemote) {
+        if (String(text ?? '').trim() === '') return undefined; // an absent field is not a value (status would read as "in progress")
         const cmp = def.cmpLocal(text);
         const v = def.toRemote(cmp);
         if (v === undefined && cmp !== '') throw new Error(`invalid ${labelOf(def)}: ${text}`);
@@ -557,6 +558,7 @@ async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapsho
         if (def.key === 'title' && text === sanitizeTitle(fresh.title)) continue; // differs only by filename sanitising
         patch[def.field] = value;
     }
+    if (!Object.keys(patch).length) return { patch, entryId: null }; // nothing representable to send
     const ts = new Date().toISOString();
     const entryId = await recordHistory(ctx.adapter, ctx.historyDir, {
         ts, op, forced: !!force && audit.state !== 'EDIT', auditId, findingId, notePath: ctx.notePath,
@@ -581,7 +583,8 @@ async function pullSections(ctx, { auditId, findingId, noteMd, sections }) {
             baseSections[def.key] = def.cmpRemote ? meta[def.key] : def.key === 'title' ? sanitizeTitle(meta[def.key]) : meta[def.key].trim();
             continue;
         }
-        if (isEmptyValue(fresh[def.field]) && (secs[def.key]?.text || '') !== '' && !(await ctx.confirmEmpty(def.key, 'pull'))) {
+        const remoteEmpty = def.kind === 'custom' ? renderCustomFields(fresh, ctx) === '' : isEmptyValue(fresh[def.field]);
+        if (remoteEmpty && (secs[def.key]?.text || '') !== '' && !(await ctx.confirmEmpty(def.key, 'pull'))) {
             throw new Error(`PwnDoc section ${def.key} is empty, refusing to blank it in the note`);
         }
         const text = await remoteToLocal(ctx, def, fresh[def.field], fresh);
@@ -697,6 +700,8 @@ async function customFieldsPatch(ctx, auditId, fresh, text) {
             entries.push(e = { id, label, type: ctx.cfTypes?.[id], text: '' });
         }
         if (e.type && e.type !== 'text' && !PLAIN_CF_TYPES.includes(e.type)) throw new Error(`custom field "${label}" (${e.type}) cannot be edited here`);
+        if (Array.isArray(e.text)) throw new Error(`custom field "${label}" cannot be edited here`);
+        if (md === ctx.htmlToMd(String(e.text ?? '')).trim()) continue; // not touched by the user: keep PwnDoc's exact value
         const rich = e.type ? e.type === 'text' : /<\/?\w+[^>]*>/.test(String(e.text ?? ''));
         e.text = rich ? await ctx.mdToHtml(await tokenizeImages(ctx, auditId, md)) : md;
     }
@@ -979,6 +984,16 @@ const captionWord = locale => (/^IT/i.test(locale || '') ? 'Figura' : /^EN/i.tes
 const figureCaption = (locale, n, text) => `*${captionWord(locale) || 'Figure'} ${n} – ${text}*`;
 const nextFigureNumber = md => Math.max(0, ...md.split('\n').map(l => +(l.match(CAPTION_RE)?.[2] ?? 0))) + 1;
 
+// Every line with whether it is inside a code fence (the fence lines themselves count as fenced)
+function linesWithFence(text) {
+    let fence = null;
+    return text.split('\n').map(line => {
+        const f = line.match(/^\s*(```+|~~~+)/);
+        if (f) { fence = !fence ? f[1][0] : f[1][0] === fence ? null : fence; return { line, fenced: true }; }
+        return { line, fenced: !!fence };
+    });
+}
+
 const fenceOpen = text => {
     let fence = null;
     for (const line of text.split('\n')) {
@@ -998,7 +1013,7 @@ function lintNote(md, { sections, fm = {}, basename = '', locale = '', exists = 
 
     // caption numbering runs through the whole note, in document order, whatever is being pushed
     const captions = Object.entries(secs).sort((a, b) => a[1].start - b[1].start)
-        .flatMap(([key, s]) => mapOutsideFences(s.text, t => t).split('\n').map(l => ({ key, m: l.match(CAPTION_RE) })).filter(c => c.m));
+        .flatMap(([key, s]) => linesWithFence(s.text).filter(l => !l.fenced).map(l => ({ key, m: l.line.match(CAPTION_RE) })).filter(c => c.m));
     captions.forEach(({ key, m }, i) => {
         if (!sections.includes(key)) return;
         if (+m[2] !== i + 1) add('warn', key, `figure numbering: expected ${i + 1}, found ${m[2]}`);
@@ -1019,12 +1034,13 @@ function lintNote(md, { sections, fm = {}, basename = '', locale = '', exists = 
         if (hasConflictMarkers(text)) add('error', key, 'unresolved merge conflict markers');
         if (fenceOpen(text)) add('error', key, 'unclosed code fence');
         if (def.kind !== 'html') continue;
-        const lines = text.split('\n');
-        lines.forEach((line, i) => {
+        const lines = linesWithFence(text);
+        lines.forEach(({ line, fenced }, i) => {
+            if (fenced) return;
             for (const r of extractImageRefs(line)) {
                 if (r.remote) { add('error', key, `remote image not supported: ${r.src}`); }
                 else if (!exists(r.src)) add('error', key, `missing image: ${r.src}`);
-                const next = lines.slice(i + 1).find(l => l.trim() !== '');
+                const next = lines.slice(i + 1).find(l => l.line.trim() !== '')?.line;
                 if (!CAPTION_RE.test(next || '')) add('warn', key, `image without caption: ${r.src}`);
             }
         });
@@ -1058,7 +1074,7 @@ async function buildDashboard(ctxFor, { audit, notes, linkedIds, loadBase }) {
         out.rows.push({
             path: n.path, findingId, title: finding.title, completed: finding.status === STATUS_DONE,
             state: overallState(rows), changed: rows.filter(r => r.changed).map(r => r.key),
-            sections: Object.fromEntries(rows.map(r => [r.key, { status: r.status, localEmpty: r.localEmpty }])),
+            sections: Object.fromEntries(rows.map(r => [r.key, { status: r.status, localEmpty: r.localEmpty, remoteEmpty: r.remoteEmpty }])),
         });
     }
     return out;
@@ -1070,10 +1086,13 @@ function bulkPlan(row, direction, keys) {
     for (const key of keys) {
         const i = row.sections?.[key];
         if (!i || i.status === 'same') continue;
-        const ok = direction === 'push' ? i.status === 'local' || (i.status === 'unknown' && !i.localEmpty)
+        // without a base "differs" may well be PwnDoc's own work: a push only fills what PwnDoc has not got, a pull only what the note has not got
+        const ok = direction === 'push' ? i.status === 'local' || (i.status === 'unknown' && !i.localEmpty && i.remoteEmpty)
             : i.status === 'remote' || (i.status === 'unknown' && i.localEmpty);
         if (ok) run.push(key);
-        else blocked.push({ key, why: i.status === 'unknown' ? (direction === 'push' ? 'note empty' : 'note has content, no sync base') : i.status });
+        else blocked.push({ key, why: i.status === 'unknown'
+            ? (direction === 'push' ? (i.localEmpty ? 'note empty' : 'differs from PwnDoc, no sync base: use Compare') : 'note has content, no sync base')
+            : i.status });
     }
     return { run, blocked };
 }
@@ -1090,17 +1109,20 @@ async function generateReport(ctx, { auditId, templateId, force }) {
     const switched = chosen !== current;
     if (switched) assertEditable(audit, force);
     const put = template => ctx.api('PUT', `/api/audits/${auditId}/general`, { body: { template } });
-    if (switched) await put(chosen);
+    let touched = false, buf, failure, warning;
     try {
-        const buf = await ctx.api('GET', `/api/audits/${auditId}/generate`, { rawResponse: true });
-        return { buf, ext: templates.find(t => t._id === chosen)?.ext || 'docx', auditName: audit.name };
-    } finally {
-        if (switched && current) await put(current);
-    }
+        if (switched) { touched = true; await put(chosen); }
+        buf = await ctx.api('GET', `/api/audits/${auditId}/generate`, { rawResponse: true });
+    } catch (e) { failure = e; }
+    if (touched && current) {
+        try { await put(current); } catch (e) { warning = `could not restore the original template (${current}): ${e.message}`; }
+    } else if (touched) warning = 'the audit had no template, it keeps the one chosen for this report';
+    if (failure) { if (warning) failure.message += ` (${warning})`; throw failure; }
+    return { buf, ext: templates.find(t => t._id === chosen)?.ext || 'docx', auditName: audit.name, warning };
 }
 
 const reportFileName = (auditName, ext, date = new Date()) => `${sanitizeTitle(auditName)} - ${date.toISOString().slice(0, 10)}.${ext}`;
-const pastedImageName = (basename, date = new Date()) => `${basename} ${date.toISOString().replace(/\D/g, '').slice(0, 14)}.png`;
+const pastedImageName = (basename, date = new Date()) => `${basename.replace(/[()\[\]#%]/g, '-')} ${date.toISOString().replace(/\D/g, '').slice(0, 14)}.png`;
 
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
 async function readFilePath(app, filePath) {
@@ -1135,6 +1157,7 @@ function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, ignore
                 else reject(new Error(`HTTP ${res.statusCode}: ${buf.toString('utf8').slice(0, 200)}`));
             });
         });
+        req.setTimeout(60000, () => req.destroy(new Error('request timed out')));
         req.on('error', reject);
         if (body) req.write(body);
         req.end();
@@ -2325,6 +2348,7 @@ class PwnDocImporterPlugin extends Plugin {
         this.remoteWarn = new Map();   // note path -> sections PwnDoc changed since the last sync
         this.remoteSeen = new Map();   // note path -> last warned signature
         this.checking = new Set();
+        this.remoteBackoff = 0;       // after a failed check (bad password, host down) stay quiet for a while
         this.addSettingTab(new PwnDocSettingTab(this.app, this));
         this.addRibbonIcon('shield-plus', 'Add vulnerability (PwnDoc)', () => {
             new ImportSourceModal(this.app, source => {
@@ -2864,6 +2888,7 @@ class PwnDocImporterPlugin extends Plugin {
         if (!fm?.pwndoc_finding_id) { new Notice('PwnDoc Importer: associate this note to a finding first.'); return; }
         const auditId = resolveAuditId(file.path, fm, this.settings.folderAudits);
         const findingId = fm.pwndoc_finding_id;
+        await this.loadCustomFieldDefs();
         const ctx = this.syncCtx(file, findingId, auditId);
         const entries = await listHistory(ctx.adapter, ctx.historyDir);
         if (!entries.length) { new Notice('PwnDoc Importer: no history for this finding yet.'); return; }
@@ -3069,7 +3094,7 @@ class PwnDocImporterPlugin extends Plugin {
 
     // Remove the finding link (the engagement attribute stays). Returns true when done.
     async unlinkNote(file) {
-        file ||= this.app.workspace.getActiveFile();
+        if (file === undefined) file = this.app.workspace.getActiveFile(); // an explicit null means the note is gone
         const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
         if (!fm?.pwndoc_finding_id) { new Notice('PwnDoc Importer: this note is not linked to a finding.'); return false; }
         if (!(await new Promise(r => new ConfirmModal(this.app, `Unlink "${file.basename}" from its PwnDoc finding? The note and the finding stay as they are; the sync history is kept.`, r).open()))) return false;
@@ -3093,7 +3118,7 @@ class PwnDocImporterPlugin extends Plugin {
             for (const [auditId, notes] of byAudit) {
                 let audit = null;
                 try { audit = await this.api('GET', `/api/audits/${auditId}`); }
-                catch (e) { if (!/HTTP (404|500)/.test(e.message)) throw e; }
+                catch (e) { if (!/HTTP 404/.test(e.message)) throw e; }
                 for (const n of notes) {
                     const reason = orphanReason(n.fm, audit);
                     if (reason) orphans.push({ path: n.path, findingId: n.fm.pwndoc_finding_id, reason });
@@ -3134,7 +3159,7 @@ class PwnDocImporterPlugin extends Plugin {
         if (!this.settings.watchRemote || !file || file.extension !== 'md' || !this.hasCredentials()) return;
         const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
         const link = resolveFindingLink(file.path, fm, this.settings.folderAudits);
-        if (!link || this.checking.has(file.path)) return;
+        if (!link || this.checking.has(file.path) || Date.now() < this.remoteBackoff) return;
         this.checking.add(file.path);
         try {
             await this.loadCustomFieldDefs();
@@ -3151,7 +3176,7 @@ class PwnDocImporterPlugin extends Plugin {
                 new Notice(`PwnDoc Importer: "${file.basename}" changed on PwnDoc (${keys.map(k => labelOf(defOf(k))).join(', ')}). Compare before you push.`, 8000);
             }
             if (!keys.length) this.remoteSeen.delete(file.path);
-        } catch (e) { this.dbg('remote check failed:', e.message); }
+        } catch (e) { this.remoteBackoff = Date.now() + 10 * 60000; this.dbg('remote check failed, pausing the background check for 10 minutes:', e.message); }
         finally { this.checking.delete(file.path); this.refreshChrome(); }
     }
 
@@ -3199,7 +3224,7 @@ class PwnDocImporterPlugin extends Plugin {
             if (folder && !(await adapter.exists(folder))) await adapter.mkdir(folder);
             const path = normalizePath(`${folder ? folder + '/' : ''}${reportFileName(audit.name, r.ext)}`);
             await adapter.writeBinary(path, r.buf.buffer.slice(r.buf.byteOffset, r.buf.byteOffset + r.buf.byteLength));
-            new Notice(`PwnDoc Importer: report saved to ${path}`);
+            new Notice(`PwnDoc Importer: report saved to ${path}${r.warning ? `. Warning: ${r.warning}` : ''}`, r.warning ? 15000 : 5000);
             this.app.openWithDefaultApp?.(path);
         } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
     }

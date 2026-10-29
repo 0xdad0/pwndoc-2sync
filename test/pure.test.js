@@ -1110,7 +1110,7 @@ test('bulkPlan pushes what the note changed, pulls what PwnDoc changed, and refu
     const row = { sections: {
         poc: { status: 'local', localEmpty: false }, description: { status: 'remote', localEmpty: false },
         scope: { status: 'conflict', localEmpty: false }, remediation: { status: 'unknown', localEmpty: true },
-        observation: { status: 'unknown', localEmpty: false }, title: { status: 'same', localEmpty: false },
+        observation: { status: 'unknown', localEmpty: false, remoteEmpty: true }, title: { status: 'same', localEmpty: false },
     } };
     const keys = ['poc', 'description', 'scope', 'remediation', 'observation', 'title', 'priority'];
     assert.deepEqual(T.bulkPlan(row, 'push', keys), { run: ['poc', 'observation'], blocked: [
@@ -1125,6 +1125,88 @@ test('buildDashboard rows carry the per-section status and take a ctx per note',
     const d = await T.buildDashboard(n => { seen.push(n.path); return cmpCtx; }, { audit, linkedIds: new Set(['f1']), loadBase: async () => null,
         notes: [{ path: 'a.md', basename: 'VT-01 - One', fm: { pwndoc_finding_id: 'f1' }, md: '## Evidenza\n\nx\n' }] });
     assert.deepEqual(seen, ['a.md']);
-    assert.deepEqual(d.rows[0].sections.poc, { status: 'same', localEmpty: false });
+    assert.deepEqual(d.rows[0].sections.poc, { status: 'same', localEmpty: false, remoteEmpty: false });
     assert.equal(d.rows[0].completed, false);
+});
+
+// ── review fixes ──────────────────────────────────────────────────────────────
+test('bulkPlan never pushes a section that differs from PwnDoc without a sync base, unless PwnDoc has nothing there', () => {
+    const row = { sections: {
+        poc: { status: 'unknown', localEmpty: false, remoteEmpty: false },
+        scope: { status: 'unknown', localEmpty: false, remoteEmpty: true },
+        status: { status: 'unknown', localEmpty: false, remoteEmpty: false },
+    } };
+    assert.deepEqual(T.bulkPlan(row, 'push', ['poc', 'scope', 'status']), { run: ['scope'], blocked: [
+        { key: 'poc', why: 'differs from PwnDoc, no sync base: use Compare' }, { key: 'status', why: 'differs from PwnDoc, no sync base: use Compare' }] });
+});
+
+test('an empty status field in the note is not pushed (it would reopen a completed finding)', async () => {
+    const ctx = syncCtx({ remote: { status: T.STATUS_DONE } });
+    ctx.noteInfo = { basename: 'VT-01 - T', fm: {} };
+    await T.pushSections(ctx, pushArgs(ctx, { noteMd: '', sections: ['status'] }));
+    assert.equal(ctx.log.puts.length, 0);
+    assert.equal(ctx.finding.status, T.STATUS_DONE);
+});
+
+test('enum codec: a non-integer like 1.5 is a plain (invalid) value, not an array index', () => {
+    const d = T.SECTION_DEFS.find(x => x.key === 'priority');
+    assert.equal(d.cmpLocal('1.5'), '1.5');
+    assert.equal(d.toRemote('1.5'), undefined);
+});
+
+test('customFieldsPatch leaves alone the fields whose text did not change', async () => {
+    const ctx = syncCtx();
+    const remote = [
+        { customField: { _id: 'cf1', label: 'CWE', fieldType: 'input' }, text: 'foo_bar*' },
+        { customField: { _id: 'cf2', label: 'Note', fieldType: 'text' }, text: '<p><u>x</u></p>' },
+    ];
+    ctx.htmlToMd = html => html.replace(/<[^>]+>/g, '');
+    // the note shows exactly what a pull rendered; only CWE is edited
+    const patch = await T.customFieldsPatch(ctx, AID, { customFields: remote }, '**CWE**\n\nCWE-89\n\n**Note**\n\nx');
+    assert.deepEqual(patch, [{ customField: 'cf1', text: 'CWE-89' }, { customField: 'cf2', text: '<p><u>x</u></p>' }]);
+});
+
+test('pulling custom fields whose values are all empty does not blank a filled note section silently', async () => {
+    const ctx = syncCtx({ remote: { customFields: [{ customField: { _id: 'cf1', label: 'CWE' }, text: '' }] } });
+    let asked = 0;
+    ctx.confirmEmpty = async () => { asked++; return false; };
+    await assert.rejects(T.pullSections(ctx, { auditId: AID, findingId: FID, noteMd: '## Custom Fields\n\n**CWE**\n\nCWE-79\n', sections: ['customFields'] }), /empty/);
+    assert.equal(asked, 1);
+});
+
+test('pastedImageName leaves no parenthesis or hash that would end the markdown image link', () => {
+    assert.equal(T.pastedImageName('VT-03 - XSS (Reflected) #1', new Date('2026-10-29T10:11:12Z')), 'VT-03 - XSS -Reflected- -1 20261029101112.png');
+});
+
+test('generateReport reports a failed restore without losing the report, and says when there was nothing to restore', async () => {
+    let fail = false;
+    const api = cur => async (method, path, opts) => {
+        if (path === '/api/audits/A1') return { state: 'EDIT', template: cur };
+        if (path === '/api/templates') return [{ _id: 't1', ext: 'docx' }, { _id: 't2', ext: 'docx' }];
+        if (method === 'PUT') { if (fail && opts.body.template === 't1') throw new Error('HTTP 500'); return 'ok'; }
+        return Buffer.from('DOC');
+    };
+    fail = true;
+    let r = await T.generateReport({ api: api('t1') }, { auditId: 'A1', templateId: 't2' });
+    assert.equal(r.buf.toString(), 'DOC');
+    assert.match(r.warning, /could not restore/);
+    fail = false;
+    r = await T.generateReport({ api: api(null) }, { auditId: 'A1', templateId: 't2' });
+    assert.match(r.warning, /had no template/);
+});
+
+test('generateReport restores the template when the switch itself fails half way', async () => {
+    const puts = [];
+    const api = async (method, path, opts) => {
+        if (path === '/api/audits/A1') return { state: 'EDIT', template: 't1' };
+        if (path === '/api/templates') return [];
+        if (method === 'PUT') { puts.push(opts.body.template); if (opts.body.template === 't2') throw new Error('timeout'); return 'ok'; }
+    };
+    await assert.rejects(T.generateReport({ api }, { auditId: 'A1', templateId: 't2' }), /timeout/);
+    assert.deepEqual(puts, ['t2', 't1']);
+});
+
+test('lint ignores images and captions inside code fences', () => {
+    const md = '## Evidenza\n\n```\n![x](https://evil/x.png)\n*Figura 9 – dentro*\n```\n\n![](a.png)\n*Figura 1 – fuori*\n';
+    assert.deepEqual(lintNote(md), []);
 });
