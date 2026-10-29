@@ -4,7 +4,7 @@ For users: see the [README](../README.md). This document describes how the plugi
 
 ## 1. Architecture
 
-- **One file, no build**: `main.js` (CommonJS, ~3500 lines) plus `manifest.json`. The plugin is the file you copy. Desktop only (uses Node `http`/`https`, `crypto`, `electron.clipboard`).
+- **One file, no build**: `main.js` (CommonJS, about 3800 lines) plus `manifest.json`. The plugin is the file you copy. Desktop only (uses Node `http`/`https`, `crypto`, `electron.clipboard`).
 - **Obsidian API used**: `secretStorage` and `SecretComponent`, `MarkdownRenderer.render`, `htmlToMarkdown`, `fileManager.processFrontMatter`, `metadataCache`, `Menu`, `MarkdownView.addAction`, status bar item, vault events (`create`, `rename`), `Modal`, `SuggestModal`, `FuzzySuggestModal`.
 - **Layering**: pure functions (no Obsidian objects) hold the logic; the plugin class and the modals are thin glue. Pure functions take a `ctx` object (see 1.2) so the pipelines run in tests with fakes.
 - **Order of `main.js`**: CSV parser, CVSS 3.1 calculator, section definitions (`SECTION_DEFS`) and codecs, HTML/Markdown converters, engagement association, images, diff and comparison, history store, push/pull pipeline, rollback, title and CVSS, three-way merge, create finding, engagement attribute helpers, side-by-side and import helpers, lint, dashboard and bulk plan, create engagement, report template and generation, delete finding, HTTP client and API helpers, settings, modals, plugin class. Pure helpers are exported through `module.exports.__test`.
