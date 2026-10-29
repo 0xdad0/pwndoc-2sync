@@ -807,3 +807,36 @@ test('F9 sanitizeHtml drops script/iframe content and keeps images when pulling'
     const body = el('body', {}, el('p', {}, 'x', el('img', { src: 'ID1', alt: 'F' })), el('script', {}, 'alert(1)'), el('iframe', { src: 'http://evil' }), el('b', {}, 'bold'));
     assert.equal(T.sanitizeHtml('ignored', () => body), '<p>x<img src="ID1" alt="F"></p><strong>bold</strong>');
 });
+
+// ── engagement attribute and quick actions ────────────────────────────────────
+const FA = { 'Clients/A': { auditId: 'A1', name: 'Audit A' }, 'Clients/A/web': { auditId: 'A2', name: 'Audit A web' } };
+
+test('folderAuditFor returns the nearest associated folder with its entry', () => {
+    assert.deepEqual(T.folderAuditFor('Clients/A/web/x.md', FA), { auditId: 'A2', name: 'Audit A web', folder: 'Clients/A/web' });
+    assert.equal(T.folderAuditFor('Clients/A/mobile/x.md', FA).folder, 'Clients/A');
+    assert.equal(T.folderAuditFor('Clients/AB/x.md', FA), null);
+    assert.equal(T.folderAuditFor('x.md', { '': { auditId: 'R', name: 'Root' } }).auditId, 'R');
+});
+
+test('notesOwnedBy keeps only notes whose nearest associated folder is the given one', () => {
+    const paths = ['Clients/A/a.md', 'Clients/A/web/w.md', 'Clients/A/web/deep/d.md', 'Clients/A/m/m.md'];
+    assert.deepEqual(T.notesOwnedBy(paths, FA, 'Clients/A'), ['Clients/A/a.md', 'Clients/A/m/m.md']);
+    assert.deepEqual(T.notesOwnedBy(paths, FA, 'Clients/A/web'), ['Clients/A/web/w.md', 'Clients/A/web/deep/d.md']);
+});
+
+test('shouldStamp skips a note linked to a finding of another engagement, and notes already up to date', () => {
+    const entry = { auditId: 'A1', name: 'Audit A' };
+    assert.equal(T.shouldStamp({}, entry), true);
+    assert.equal(T.shouldStamp(undefined, entry), true);
+    assert.equal(T.shouldStamp({ pwndoc_audit_id: 'A9' }, entry), true);                       // only an association, no finding: may move
+    assert.equal(T.shouldStamp({ pwndoc_audit_id: 'A9', pwndoc_finding_id: 'F' }, entry), false);
+    assert.equal(T.shouldStamp({ pwndoc_audit_id: 'A1', pwndoc_finding_id: 'F' }, entry), true);
+    assert.equal(T.shouldStamp({ pwndoc_audit_id: 'A1', pwndoc_audit: 'Audit A' }, entry), false); // nothing to write
+});
+
+test('engagementStatus shows the engagement name and whether the note has a finding', () => {
+    assert.deepEqual(T.engagementStatus({ pwndoc_audit: 'Audit A', pwndoc_finding_id: 'F' }, null), { text: 'PwnDoc: Audit A', linked: true });
+    assert.deepEqual(T.engagementStatus({}, { name: 'Audit A' }), { text: 'PwnDoc: Audit A · no finding', linked: false });
+    assert.match(T.engagementStatus({ pwndoc_audit_id: 'abcdef123456' }, null).text, /^PwnDoc: audit abcdef/);
+    assert.deepEqual(T.engagementStatus({}, null), { text: '', linked: false });
+});

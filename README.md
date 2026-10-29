@@ -124,9 +124,15 @@ Link notes to a PwnDoc **engagement (audit)**, compare them with the matching **
 
 | Command | What it does |
 |---|---|
-| **Associate folder to PwnDoc engagement** | Pick a vault folder and an audit. Subfolders inherit it (nearest folder wins). Renaming the folder keeps the association. New notes imported into an associated folder get `pwndoc_audit_id`. |
+| **Associate folder to PwnDoc engagement** | Pick a vault folder (or right-click a folder in the file explorer) and an audit. Subfolders inherit it (nearest folder wins). Renaming the folder keeps the association. Every note the folder owns gets `pwndoc_audit_id` and `pwndoc_audit` (the engagement name) in its frontmatter, so it shows in the Properties panel and can be searched or used in Bases. Notes created or moved into the folder get it too; notes already linked to a finding of another engagement are left alone. |
 | **Associate note to PwnDoc finding** | Picks the finding of the audit (best title match first) and writes `pwndoc_audit_id` and `pwndoc_finding_id` in the frontmatter. If the audit has no finding with the note title it offers to create one. |
 | **Create PwnDoc finding for this note** | Links an existing finding with the same title, otherwise creates one from a **library vulnerability** (the one in `pwndoc_id` is suggested, any other can be picked) or a **blank** finding with the note title and CVSS. Then opens the compare with Evidenza selected. |
+
+### Quick actions
+
+- **Status bar:** for a note that belongs to an engagement it shows `PwnDoc: <engagement>` (with `· no finding` until the note is linked). Click it for a menu with compare, associate note, create finding, history, associate folder and refresh.
+- **Note header buttons:** compare/merge and history appear once the note is linked to a finding; link and create-finding appear while it is not.
+- **Refresh engagement attribute on notes** (command or status-bar menu) re-reads the engagement names from PwnDoc and rewrites the attribute on every associated folder, for example after renaming an audit.
 
 ### Compare and merge
 

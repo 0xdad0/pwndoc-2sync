@@ -1,6 +1,6 @@
 'use strict';
 
-const { Plugin, PluginSettingTab, Setting, FuzzySuggestModal, SuggestModal, Modal, Notice, normalizePath, SecretComponent, Component, MarkdownRenderer, htmlToMarkdown } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, FuzzySuggestModal, SuggestModal, Modal, Notice, normalizePath, SecretComponent, Component, MarkdownRenderer, htmlToMarkdown, Menu, MarkdownView } = require('obsidian');
 
 // ── CSV Parser ────────────────────────────────────────────────────────────────
 function parseCSV(text) {
@@ -208,10 +208,7 @@ const parentDir = p => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
 // Note frontmatter wins; otherwise the nearest associated ancestor folder
 function resolveAuditId(notePath, fm, folderAudits) {
     if (fm?.pwndoc_audit_id) return fm.pwndoc_audit_id;
-    for (let dir = parentDir(notePath); ; dir = parentDir(dir)) {
-        if (folderAudits[dir]) return folderAudits[dir].auditId;
-        if (!dir) return null;
-    }
+    return folderAuditFor(notePath, folderAudits)?.auditId ?? null;
 }
 
 function renameFolderKeys(folderAudits, oldPath, newPath) {
@@ -816,6 +813,32 @@ function resolveFindingLink(notePath, fm, folderAudits, override = {}) {
     const findingId = override.findingId ?? fm?.pwndoc_finding_id;
     const auditId = override.auditId ?? resolveAuditId(notePath, fm, folderAudits);
     return auditId && findingId ? { auditId, findingId } : null;
+}
+
+// ── Engagement attribute on notes, status and quick actions ───────────────────
+// Nearest associated folder of a note: { auditId, name, folder } or null
+function folderAuditFor(notePath, folderAudits) {
+    for (let dir = parentDir(notePath); ; dir = parentDir(dir)) {
+        if (folderAudits[dir]) return { ...folderAudits[dir], folder: dir };
+        if (!dir) return null;
+    }
+}
+
+// Notes whose engagement comes from `folder`, not from a more specific subfolder
+const notesOwnedBy = (paths, folderAudits, folder) =>
+    paths.filter(p => folderAuditFor(p, folderAudits)?.folder === folder);
+
+// A note linked to a finding of another audit keeps its audit: moving it would orphan the link
+const linkedElsewhere = (fm, entry) => !!(fm?.pwndoc_finding_id && fm?.pwndoc_audit_id && fm.pwndoc_audit_id !== entry.auditId);
+const shouldStamp = (fm, entry) =>
+    !linkedElsewhere(fm, entry) && !(fm?.pwndoc_audit_id === entry.auditId && fm?.pwndoc_audit === entry.name);
+
+function engagementStatus(fm, entry) {
+    const name = fm?.pwndoc_audit || entry?.name
+        || (fm?.pwndoc_audit_id ? `audit ${String(fm.pwndoc_audit_id).slice(0, 6)}…` : '');
+    if (!name) return { text: '', linked: false };
+    const linked = !!fm?.pwndoc_finding_id;
+    return { text: `PwnDoc: ${name}${linked ? '' : ' · no finding'}`, linked };
 }
 
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
@@ -1818,12 +1841,34 @@ class PwnDocImporterPlugin extends Plugin {
             callback: () => this.createFindingForNote(),
         });
         this.registerEvent(this.app.vault.on('rename', async (file, oldPath) => {
-            if (file.children === undefined) return; // folders only
+            if (file.children === undefined) { this.stampLater(file); return; } // a moved note adopts its new folder's engagement
             const next = renameFolderKeys(this.settings.folderAudits, oldPath, file.path);
             if (JSON.stringify(next) === JSON.stringify(this.settings.folderAudits)) return;
             this.settings.folderAudits = next;
             await this.saveSettings();
         }));
+
+        this.statusEl = this.addStatusBarItem();
+        this.statusEl.addClass('mod-clickable');
+        this.statusEl.onclick = e => this.openQuickMenu(e);
+        this.addCommand({
+            id: 'refresh-engagement-attributes',
+            name: 'Refresh engagement attribute on notes',
+            callback: () => this.refreshEngagementAttributes(),
+        });
+        const refresh = () => this.refreshChrome();
+        this.registerEvent(this.app.workspace.on('file-open', refresh));
+        this.registerEvent(this.app.workspace.on('active-leaf-change', refresh));
+        this.registerEvent(this.app.metadataCache.on('changed', f => { if (f === this.app.workspace.getActiveFile()) refresh(); }));
+        this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
+            if (file.children === undefined) return;
+            menu.addItem(i => i.setTitle('Associate to PwnDoc engagement').setIcon('shield-plus')
+                .onClick(() => this.associateFolder(file.path === '/' ? '' : file.path)));
+        }));
+        this.app.workspace.onLayoutReady(() => {
+            refresh();
+            this.registerEvent(this.app.vault.on('create', f => this.stampLater(f)));
+        });
     }
 
     async loadSettings() {
@@ -2018,15 +2063,115 @@ class PwnDocImporterPlugin extends Plugin {
         });
     }
 
-    async associateFolder() {
-        const active = this.app.workspace.getActiveFile();
-        new FolderModal(this.app, active?.parent?.path === '/' ? '' : (active?.parent?.path ?? ''), async folder => {
+    // Associate a folder with an engagement and write it on every note it owns (subfolders included)
+    async associateFolder(folderArg) {
+        const run = async folder => {
             const audit = await this.pickAudit();
             if (!audit) return;
             this.settings.folderAudits[folder] = { auditId: audit._id, name: audit.name };
             await this.saveSettings();
-            new Notice(`PwnDoc Importer: "${folder || '/'}" → ${audit.name}`);
-        }).open();
+            await this.stampFolder(folder);
+        };
+        if (folderArg !== undefined) return run(folderArg);
+        const active = this.app.workspace.getActiveFile();
+        new FolderModal(this.app, active?.parent?.path === '/' ? '' : (active?.parent?.path ?? ''), run).open();
+    }
+
+    // pwndoc_audit_id + pwndoc_audit (the engagement name) in the frontmatter of the notes `folder` owns
+    async stampFolder(folder, { quiet = false } = {}) {
+        const entry = this.settings.folderAudits[folder];
+        if (!entry) return;
+        const files = this.app.vault.getMarkdownFiles().filter(f => !folder || f.path.startsWith(folder + '/'));
+        const owned = new Set(notesOwnedBy(files.map(f => f.path), this.settings.folderAudits, folder));
+        let done = 0, skipped = 0;
+        for (const f of files.filter(x => owned.has(x.path))) {
+            const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
+            if (linkedElsewhere(fm, entry)) { skipped++; continue; }
+            if (!shouldStamp(fm, entry)) continue;
+            await this.app.fileManager.processFrontMatter(f, p => { p.pwndoc_audit_id = entry.auditId; p.pwndoc_audit = entry.name; });
+            done++;
+        }
+        if (!quiet) {
+            new Notice(`PwnDoc Importer: "${folder || '/'}" → ${entry.name}; engagement written on ${done} note(s)`
+                + (skipped ? `, ${skipped} skipped (linked to a finding of another engagement)` : '') + '.');
+        }
+    }
+
+    // Re-read the engagement names from PwnDoc (if reachable) and rewrite the attribute everywhere
+    async refreshEngagementAttributes() {
+        try {
+            const audits = (await this.api('GET', '/api/audits')) || [];
+            for (const entry of Object.values(this.settings.folderAudits)) {
+                const a = audits.find(x => x._id === entry.auditId);
+                if (a) entry.name = a.name;
+            }
+            await this.saveSettings();
+        } catch (e) { new Notice(`PwnDoc Importer: names not refreshed (${e.message}), using the stored ones.`); }
+        for (const folder of Object.keys(this.settings.folderAudits)) await this.stampFolder(folder, { quiet: true });
+        new Notice('PwnDoc Importer: engagement attribute refreshed on all associated folders.');
+    }
+
+    // A note created in or moved into an associated folder gets the attribute too
+    stampLater(file) {
+        if (file.extension !== 'md') return;
+        const entry = folderAuditFor(file.path, this.settings.folderAudits);
+        if (!entry) return;
+        setTimeout(async () => {
+            const f = this.app.vault.getAbstractFileByPath(file.path);
+            if (!f) return;
+            const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
+            if (shouldStamp(fm, entry)) {
+                await this.app.fileManager.processFrontMatter(f, p => { p.pwndoc_audit_id = entry.auditId; p.pwndoc_audit = entry.name; });
+            }
+        }, 500);
+    }
+
+    // Status bar text and the buttons in the header of the open note
+    refreshChrome() {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        const file = view?.file;
+        const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
+        const entry = file && folderAuditFor(file.path, this.settings.folderAudits);
+        const st = file ? engagementStatus(fm, entry) : { text: '', linked: false };
+        this.statusEl.setText(st.text);
+        this.statusEl.style.display = st.text ? '' : 'none';
+        this.statusEl.title = st.text ? 'PwnDoc Importer: click for quick actions' : '';
+        if (!view) return;
+
+        this.headerActions ||= new WeakMap();
+        let a = this.headerActions.get(view);
+        if (!a) {
+            const act = (icon, title, fn) => view.addAction(icon, title, () => {
+                this.app.workspace.setActiveLeaf(view.leaf, { focus: true });
+                fn();
+            });
+            a = {
+                compare: act('git-compare', 'Compare with PwnDoc and merge', () => this.compareWithPwndoc()),
+                history: act('history', 'PwnDoc sync history (rollback)', () => this.rollbackFromHistory()),
+                link:    act('link', 'Associate note to PwnDoc finding', () => this.associateNote()),
+                create:  act('plus-circle', 'Create PwnDoc finding for this note', () => this.createFindingForNote()),
+            };
+            this.headerActions.set(view, a);
+        }
+        const related = !!(fm?.pwndoc_audit_id || fm?.pwndoc || entry);
+        const show = (el, v) => { el.style.display = v ? '' : 'none'; };
+        show(a.compare, related && st.linked);
+        show(a.history, related && st.linked);
+        show(a.link, related && !st.linked);
+        show(a.create, related && !st.linked);
+    }
+
+    openQuickMenu(evt) {
+        const menu = new Menu();
+        const item = (title, icon, fn) => menu.addItem(i => i.setTitle(title).setIcon(icon).onClick(fn));
+        item('Compare with PwnDoc and merge', 'git-compare', () => this.compareWithPwndoc());
+        item('Associate note to finding', 'link', () => this.associateNote());
+        item('Create PwnDoc finding for this note', 'plus-circle', () => this.createFindingForNote());
+        item('Sync history (rollback)', 'history', () => this.rollbackFromHistory());
+        menu.addSeparator();
+        item('Associate folder to engagement', 'folder-plus', () => this.associateFolder());
+        item('Refresh engagement attribute on notes', 'refresh-cw', () => this.refreshEngagementAttributes());
+        menu.showAtMouseEvent(evt);
     }
 
     // Resolve the audit for a note: its frontmatter, then the nearest associated folder, else ask
@@ -2054,6 +2199,7 @@ class PwnDocImporterPlugin extends Plugin {
             if (!finding) return;
             await this.app.fileManager.processFrontMatter(file, fm => {
                 fm.pwndoc_audit_id = auditId;
+                fm.pwndoc_audit = audit.name;
                 fm.pwndoc_finding_id = finding._id;
             });
             new Notice(`PwnDoc Importer: linked to "${finding.title}"`);
@@ -2202,7 +2348,7 @@ class PwnDocImporterPlugin extends Plugin {
             const title = titleFromBasename(file.basename);
             const existing = matchFinding(title, audit.findings || []);
             if (existing && await confirm(`The audit already has a finding titled "${existing.title}". Link this note to it instead of creating a new one?`)) {
-                await this.app.fileManager.processFrontMatter(file, f => { f.pwndoc_audit_id = auditId; f.pwndoc_finding_id = existing._id; });
+                await this.app.fileManager.processFrontMatter(file, f => { f.pwndoc_audit_id = auditId; f.pwndoc_audit = audit.name; f.pwndoc_finding_id = existing._id; });
                 new Notice(`PwnDoc Importer: linked to "${existing.title}"`);
                 return;
             }
@@ -2217,7 +2363,7 @@ class PwnDocImporterPlugin extends Plugin {
             const force = audit.state !== 'EDIT'
                 && await confirm(`The audit is in state ${audit.state}. Enforce: create the finding anyway?`);
             const findingId = await createFinding({ api: (m, p, o) => this.api(m, p, o) }, auditId, body, force);
-            await this.app.fileManager.processFrontMatter(file, f => { f.pwndoc_audit_id = auditId; f.pwndoc_finding_id = findingId; });
+            await this.app.fileManager.processFrontMatter(file, f => { f.pwndoc_audit_id = auditId; f.pwndoc_audit = audit.name; f.pwndoc_finding_id = findingId; });
             await recordHistory(this.app.vault.adapter, historyDir(this.manifest.dir, findingId), {
                 ts: new Date().toISOString(), op: 'create', forced: force, auditId, findingId, notePath: file.path,
                 sections: [], remoteBefore: null, localBefore: await this.app.vault.read(file),
@@ -2292,6 +2438,7 @@ class PwnDocImporterPlugin extends Plugin {
         const noteName = `${prefix}-${num} - ${title}`;
         const filePath = folder ? `${folder}/${noteName}.md` : `${noteName}.md`;
         const auditId = resolveAuditId(filePath, {}, this.settings.folderAudits);
+        const auditEntry = folderAuditFor(filePath, this.settings.folderAudits);
 
         // Custom fields section at the end
         const cfSection = extraCf.length > 0
@@ -2329,6 +2476,7 @@ class PwnDocImporterPlugin extends Plugin {
             `category: "${vuln.category}"`,
             `assets: "INSERT_ASSET"`,
             ...(auditId ? [`pwndoc_audit_id: "${auditId}"`] : []),
+            ...(auditEntry ? [`pwndoc_audit: ${JSON.stringify(auditEntry.name)}`] : []),
             '---',
         ].join('\n');
 
@@ -2379,7 +2527,7 @@ module.exports = PwnDocImporterPlugin;
 module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
-    canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,
+    folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,
     matchFinding, buildFindingFromLibrary, buildFindingFromNote, createFinding, classify, merge3, hasConflictMarkers, applyMerged, isValidCvss31, cvssFrontmatter, localValue, labelOf, historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase,
     AuditLockedError, assertEditable, findingHash, assertUnchanged, isEmptyValue, pushSections, pullSections,
     restoreRemotePatch, restoreLocal, buildRollbackComparison, rollbackSections };
