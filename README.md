@@ -152,7 +152,13 @@ Link notes to a PwnDoc **engagement (audit)**, compare them with the matching **
 | References | `references` |
 | Title (file name after `VT-NN - `) | `title` |
 | CVSS vector (`cvss_vector`) | `cvssv3` |
-| Custom Fields | shown in the diff only, never written |
+| Vulnerability type (`category`) | `vulnType` |
+| Priority (`priority`: low, medium, high, urgent or 1 to 4) | `priority` |
+| Remediation complexity (`remediation_complexity`: easy, medium, hard or 1 to 3) | `remediationComplexity` |
+| Completed (`status`: `COMPLETED` or `DONE` means completed, anything else in progress) | `status` |
+| Custom Fields (`**label**` blocks, written by the importer) | `customFields` |
+
+An empty priority or complexity in the note is never pushed (it would blank the field on PwnDoc). A pull writes `status: COMPLETED` when the finding is completed, and `status: DRAFT` only when the note said completed and PwnDoc says in progress; other workflow values (`REVIEW`...) are left alone. Custom fields: only the ones named in the note are updated and the others on the finding are kept; rich text fields go through the same Markdown to HTML conversion as the sections, input, date, radio and select fields are plain text, other types (multiple select, checkbox) are refused.
 
 - **Three-way status.** After every successful sync the plugin stores the synced text of each section as a base. A section is then `changed in the note`, `changed on PwnDoc`, `changed on both sides` or `identical`; the direction is preselected accordingly. When both sides changed, a line-level three-way merge is proposed in an editable box: changes on different lines are combined, changes on the same or adjacent lines produce `<<<<<<< local / ======= / >>>>>>> pwndoc` markers that must be resolved before **Apply** works. Without a base (first sync) the comparison is two-way.
 - **Images.** Images in the section (`![alt](path)` and `![[path|alt]]`) are uploaded to PwnDoc and referenced as `<img src="<id>" alt="<alt>">`; the alt text is the caption. Uploads are cached by content hash, so repeating a push does not re-upload. Pulling downloads PwnDoc images into the **attachments folder** and rewrites them to vault links. Images above 12 MB, remote `http(s)` images and unsupported types are rejected before anything is written.
@@ -160,6 +166,43 @@ Link notes to a PwnDoc **engagement (audit)**, compare them with the matching **
 - **Empty sections.** Overwriting a populated section with an empty one (either direction) asks for confirmation.
 - **Only the selected fields are written** (the finding update is a patch), and a push is aborted if the selected fields changed on PwnDoc after you opened the compare.
 - **Audit state guard.** Writing to PwnDoc requires the audit to be in state `EDIT`. Otherwise the dialog shows the state and an **Enforce** checkbox (off by default, valid for that operation only); forced operations are marked in the history. Pulling is local and is never blocked.
+
+### Engagement dashboard and bulk sync
+
+**Engagement dashboard** (command, status-bar menu, or right-click a folder) reads the engagement once and shows one row per linked note: finding completed or in progress, sync state (`in sync`, `changed in the note`, `changed on PwnDoc`, `conflict`, `differs, no sync base`) and which sections differ. Only sections that matter are counted: Evidenza, plus any other section that has content in the note or a sync base. From the dashboard:
+
+- **Open** / **Compare** a note.
+- **Push selected sections** / **Pull selected sections** for the ticked notes, for the sections ticked above the list (Evidenza by default). The plugin never overwrites a side that changed on its own: a push skips sections changed on PwnDoc or in conflict, a pull skips sections changed in the note or in conflict, and an empty note section is not pushed. The skipped ones are listed at the end. The usual guards apply (state `EDIT` or **Enforce**, changed-since-read check, history entry per note, lint errors skip the note).
+- Lists the **orphan notes** (their finding or engagement is gone from PwnDoc) with **Unlink**, the notes without a finding, and the findings that have no note, with a shortcut to import them.
+
+### Lint before a push
+
+Every push from the compare dialog runs **Lint** on the sections being pushed; **Lint this note before pushing** runs it on demand. Errors block the push, warnings ask for confirmation.
+
+| Level | Check |
+|---|---|
+| error | image file missing, remote image, unresolved merge conflict markers, unclosed code fence, invalid CVSS vector, unknown priority or complexity name, empty title |
+| warn | empty section, image without caption, caption not numbered progressively through the note, caption word not matching the audit language (`Figura` for IT, `Figure` for EN), hyphen instead of an en dash |
+
+The caption format is `*Figura X – description*` / `*Figure X – description*` on the line right after the image.
+
+### Changes on PwnDoc while you work
+
+When a linked note is opened (and every *Check interval* minutes for the open note) the plugin compares the finding with the last synced state and, if PwnDoc changed a synced section, shows `changed on PwnDoc: <sections>` in the status bar and a notice once. It only reads, never prompts for credentials and does nothing for notes without a sync base. Turn it off with **Warn about changes on PwnDoc**.
+
+### Unlink, orphans, completion
+
+- **Unlink note from its PwnDoc finding** removes `pwndoc_finding_id` (the engagement attribute and the history stay).
+- **Find orphan notes** checks every linked note of the vault against PwnDoc.
+- **Mark PwnDoc finding as completed** / **Reopen PwnDoc finding** change `status` on PwnDoc (state guard and history apply) and mirror it in the note frontmatter.
+
+### Report
+
+**Generate PwnDoc report (choose template)** lists the templates of the PwnDoc instance (the audit's current one first), generates the report of the engagement and saves it in the **Reports folder** (then opens it with the default application). PwnDoc renders with the template stored on the audit, so choosing a different one switches the template for the duration of the call and puts the original back afterwards, also if the generation fails. That switch is a write: it requires the audit in state `EDIT` or **Enforce**.
+
+### Images with figure captions
+
+**Paste clipboard image with numbered caption** (command, assign a hotkey if you want) saves the clipboard image in the attachments folder, asks for the description and inserts at the cursor `![](path)` followed by `*Figura N – description*` (or `*Figure N – ...*` from the `locale` of the note), N being the next number in the note.
 
 ### History and rollback
 
@@ -173,6 +216,9 @@ The history folder contains client data: do not commit it (`history/` is git-ign
 |---|---|---|
 | **Attachments folder** | `attachments` | Vault folder where images pulled from PwnDoc are saved |
 | **History entries per finding** | `50` | Older history entries are pruned |
+| **Warn about changes on PwnDoc** | on | Check the open note against PwnDoc |
+| **Check interval (minutes)** | `5` | `0` = only when a note is opened (reload the plugin to apply) |
+| **Reports folder** | `reports` | Where generated reports are saved |
 
 ## Generated Note Structure
 

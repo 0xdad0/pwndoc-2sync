@@ -1045,7 +1045,7 @@ const orphanReason = (fm, audit) => !fm?.pwndoc_finding_id ? ''
     : (audit.findings || []).some(f => f._id === fm.pwndoc_finding_id) ? '' : 'finding not found in the engagement';
 
 // notes: [{ path, basename, fm, md }] of this engagement. One row per linked note, plus what does not pair up.
-async function buildDashboard(ctx, { audit, notes, linkedIds, loadBase }) {
+async function buildDashboard(ctxFor, { audit, notes, linkedIds, loadBase }) {
     const out = { rows: [], orphans: [], unlinked: [], missing: missingFindings(audit, linkedIds) };
     const keys = SECTION_DEFS.map(d => d.key);
     for (const n of notes) {
@@ -1053,13 +1053,29 @@ async function buildDashboard(ctx, { audit, notes, linkedIds, loadBase }) {
         if (!findingId) { out.unlinked.push(n); continue; }
         const finding = audit.findings?.find(f => f._id === findingId);
         if (!finding) { out.orphans.push({ path: n.path, findingId, reason: orphanReason(n.fm, audit) }); continue; }
+        const ctx = typeof ctxFor === 'function' ? ctxFor(n, findingId) : ctxFor; // image paths resolve per note
         const rows = watchedRows(await buildComparison(ctx, n.md, finding, keys, { basename: n.basename, fm: n.fm }, await loadBase(findingId)));
         out.rows.push({
             path: n.path, findingId, title: finding.title, completed: finding.status === STATUS_DONE,
             state: overallState(rows), changed: rows.filter(r => r.changed).map(r => r.key),
+            sections: Object.fromEntries(rows.map(r => [r.key, { status: r.status, localEmpty: r.localEmpty }])),
         });
     }
     return out;
+}
+
+// What a bulk push or pull may do for one dashboard row: never overwrite a side that changed on its own
+function bulkPlan(row, direction, keys) {
+    const run = [], blocked = [];
+    for (const key of keys) {
+        const i = row.sections?.[key];
+        if (!i || i.status === 'same') continue;
+        const ok = direction === 'push' ? i.status === 'local' || (i.status === 'unknown' && !i.localEmpty)
+            : i.status === 'remote' || (i.status === 'unknown' && i.localEmpty);
+        if (ok) run.push(key);
+        else blocked.push({ key, why: i.status === 'unknown' ? (direction === 'push' ? 'note empty' : 'note has content, no sync base') : i.status });
+    }
+    return { run, blocked };
 }
 
 // ── Report generation ─────────────────────────────────────────────────────────
@@ -1259,6 +1275,9 @@ const DEFAULT_SETTINGS = {
     historyLimit:    50, // history entries kept per finding
     imageCache:      {}, // { [auditId]: { [sha256]: pwndoc image id } }
     attachmentsFolder: 'attachments', // where pulled images are saved (vault path)
+    watchRemote:     true,  // warn when PwnDoc changed a synced section of the open note
+    watchIntervalMin: 5,    // 0 = only when a note is opened
+    reportsFolder:   'reports', // where generated reports are saved (vault path)
 };
 
 // ── Modal: fuzzy search over vuln list ────────────────────────────────────────
@@ -1678,6 +1697,30 @@ class PwnDocSettingTab extends PluginSettingTab {
                     if (n >= 1) { this.plugin.settings.historyLimit = n; await this.plugin.saveSettings(); }
                 }));
 
+        new Setting(containerEl)
+            .setName('Warn about changes on PwnDoc')
+            .setDesc('Check the open note against PwnDoc when it is opened (and periodically) and show which sections changed remotely')
+            .addToggle(t => t.setValue(this.plugin.settings.watchRemote)
+                .onChange(async v => { this.plugin.settings.watchRemote = v; await this.plugin.saveSettings(); }));
+
+        new Setting(containerEl)
+            .setName('Check interval (minutes)')
+            .setDesc('0 = only when a note is opened. Takes effect after reloading the plugin.')
+            .addText(t => t
+                .setValue(String(this.plugin.settings.watchIntervalMin))
+                .onChange(async v => {
+                    const n = parseInt(v, 10);
+                    if (n >= 0) { this.plugin.settings.watchIntervalMin = n; await this.plugin.saveSettings(); }
+                }));
+
+        new Setting(containerEl)
+            .setName('Reports folder')
+            .setDesc('Vault folder where generated reports are saved')
+            .addText(t => t
+                .setPlaceholder('reports')
+                .setValue(this.plugin.settings.reportsFolder)
+                .onChange(async v => { this.plugin.settings.reportsFolder = v.trim().replace(/\/+$/, ''); await this.plugin.saveSettings(); }));
+
         containerEl.createEl('h3', { text: 'Debug' });
 
         new Setting(containerEl)
@@ -2085,10 +2128,203 @@ class LibraryVulnPickModal extends FuzzySuggestModal {
     onClose() { super.onClose(); setTimeout(() => { if (!this.chosen) this.onChoose(null); }, 0); }
 }
 
+// ── Modal: lint result before a push (or on demand) ───────────────────────────
+// onAnswer(true) only when there are no errors and the user chose to go on
+class LintModal extends Modal {
+    constructor(app, issues, onAnswer) {
+        super(app);
+        this.issues = issues;
+        this.onAnswer = onAnswer; // (boolean) => void, null when only shown
+        this.answered = false;
+    }
+    onOpen() {
+        const { contentEl } = this;
+        const errors = this.issues.filter(i => i.level === 'error').length;
+        contentEl.createEl('h3', { text: this.issues.length ? `Lint: ${errors} error(s), ${this.issues.length - errors} warning(s)` : 'Lint: no issues' });
+        for (const i of this.issues) {
+            const line = contentEl.createEl('div');
+            line.style.cssText = `margin:2px 0;color:${i.level === 'error' ? 'var(--text-error)' : 'var(--text-warning)'};`;
+            line.setText(`${i.level === 'error' ? '✗' : '!'} [${labelOf(defOf(i.section))}] ${i.message}`);
+        }
+        const answer = v => { this.answered = true; this.close(); this.onAnswer?.(v); };
+        const bar = contentEl.createEl('div');
+        bar.style.cssText = 'display:flex;gap:8px;margin-top:12px;';
+        if (this.onAnswer && !errors) bar.createEl('button', { text: 'Continue anyway', cls: 'mod-warning' }).onclick = () => answer(true);
+        bar.createEl('button', { text: this.onAnswer ? 'Cancel' : 'Close' }).onclick = () => answer(false);
+    }
+    onClose() { this.contentEl.empty(); if (!this.answered) this.onAnswer?.(false); }
+}
+
+// ── Modal: one line of text (figure caption) ──────────────────────────────────
+class PromptModal extends Modal {
+    constructor(app, title, placeholder, onSubmit) {
+        super(app);
+        this.title = title;
+        this.placeholder = placeholder;
+        this.onSubmit = onSubmit; // (string | null) => void
+        this.done = false;
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl('h3', { text: this.title });
+        const input = contentEl.createEl('input', { type: 'text', placeholder: this.placeholder });
+        input.style.width = '100%';
+        const submit = v => { this.done = true; this.close(); this.onSubmit(v); };
+        input.addEventListener('keydown', e => { if (e.key === 'Enter' && input.value.trim()) submit(input.value.trim()); });
+        const ok = contentEl.createEl('button', { text: 'Insert', cls: 'mod-cta' });
+        ok.style.marginTop = '8px';
+        ok.onclick = () => { if (input.value.trim()) submit(input.value.trim()); };
+        setTimeout(() => input.focus(), 0);
+    }
+    onClose() { this.contentEl.empty(); if (!this.done) this.onSubmit(null); }
+}
+
+// ── Modal: choose the report template ─────────────────────────────────────────
+class TemplatePickModal extends SuggestModal {
+    constructor(app, templates, currentId, onChoose) {
+        super(app);
+        this.templates = templates;
+        this.currentId = currentId;
+        this.onChoose = onChoose; // (templateId | null) => void
+        this.chosen = false;
+        this.setPlaceholder('Report template...');
+    }
+    getSuggestions(q) {
+        const query = q.toLowerCase();
+        return this.templates.filter(t => `${t.name} ${t.ext}`.toLowerCase().includes(query))
+            .sort((a, b) => (b._id === this.currentId) - (a._id === this.currentId));
+    }
+    renderSuggestion(t, el) {
+        el.createEl('div', { text: t.name });
+        el.createEl('small', { text: [t.ext, t._id === this.currentId ? 'current template of the audit' : ''].filter(Boolean).join(' · '), cls: 'pwndoc-meta' });
+    }
+    onChooseSuggestion(t) { this.chosen = true; this.onChoose(t._id); }
+    onClose() { super.onClose(); setTimeout(() => { if (!this.chosen) this.onChoose(null); }, 0); }
+}
+
+// ── Modal: engagement dashboard and orphan list ───────────────────────────────
+// data: buildDashboard() result (rows may be empty for the orphan view); audit: the PwnDoc audit or null
+class DashboardModal extends Modal {
+    constructor(app, plugin, data, { title, audit }) {
+        super(app);
+        this.plugin = plugin;
+        this.data = data;
+        this.title = title;
+        this.audit = audit;
+    }
+
+    onOpen() {
+        const { contentEl, data, audit } = this;
+        contentEl.empty();
+        this.modalEl.style.width = 'min(920px, 95vw)';
+        contentEl.createEl('h3', { text: this.title });
+        const COLOR = { same: 'var(--text-success)', unknown: 'var(--text-muted)', remote: 'var(--text-accent)', local: 'var(--text-warning)', conflict: 'var(--text-error)' };
+        const LABEL = { same: 'in sync', unknown: 'differs, no sync base', remote: 'changed on PwnDoc', local: 'changed in the note', conflict: 'conflict' };
+        const open = async path => {
+            const f = this.app.vault.getAbstractFileByPath(path);
+            if (f) await this.app.workspace.getLeaf().openFile(f);
+        };
+        const line = parent => {
+            const d = parent.createEl('div');
+            d.style.cssText = 'display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--background-modifier-border);';
+            return d;
+        };
+        const btn = (parent, text, fn) => { const b = parent.createEl('button', { text }); b.onclick = fn; return b; };
+
+        const selected = new Set(DEFAULT_SYNC_SECTIONS);
+        const checks = [];
+        let forceBox = null;
+
+        if (data.rows.length) {
+            const counts = data.rows.reduce((c, r) => ({ ...c, [r.state]: (c[r.state] || 0) + 1 }), {});
+            contentEl.createEl('small', { text: Object.entries(counts).map(([k, v]) => `${v} ${LABEL[k]}`).join(' · '), cls: 'pwndoc-meta' });
+
+            const secs = contentEl.createEl('div');
+            secs.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px 12px;margin:8px 0;';
+            secs.createEl('strong', { text: 'Sections for bulk actions:' });
+            for (const def of SECTION_DEFS) {
+                const l = secs.createEl('label');
+                const c = l.createEl('input', { type: 'checkbox' });
+                c.checked = selected.has(def.key);
+                c.onchange = () => (c.checked ? selected.add(def.key) : selected.delete(def.key));
+                l.createEl('span', { text: ' ' + labelOf(def) });
+            }
+
+            for (const row of data.rows) {
+                const l = line(contentEl);
+                const c = l.createEl('input', { type: 'checkbox' });
+                checks.push({ c, row });
+                const t = l.createEl('span', { text: row.title });
+                t.style.flex = '1';
+                l.createEl('small', { text: row.completed ? '✓ completed' : 'in progress', cls: 'pwndoc-meta' });
+                const st = l.createEl('span', { text: LABEL[row.state] });
+                st.style.cssText = `color:${COLOR[row.state]};min-width:150px;`;
+                l.createEl('small', { text: row.changed.map(k => labelOf(defOf(k))).join(', '), cls: 'pwndoc-meta' });
+                btn(l, 'Open', () => open(row.path));
+                btn(l, 'Compare', async () => { this.close(); await open(row.path); this.plugin.compareWithPwndoc(); });
+            }
+
+            const bar = contentEl.createEl('div');
+            bar.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px;';
+            btn(bar, 'Select all', () => checks.forEach(x => { x.c.checked = true; }));
+            btn(bar, 'Select changed', () => checks.forEach(x => { x.c.checked = x.row.state !== 'same'; }));
+            if (audit && audit.state !== 'EDIT') {
+                const w = bar.createEl('label');
+                forceBox = w.createEl('input', { type: 'checkbox' });
+                w.createEl('span', { text: ` Enforce (audit is ${audit.state})` });
+            }
+            const run = direction => async () => {
+                const rows = checks.filter(x => x.c.checked).map(x => x.row);
+                if (!rows.length || !selected.size) { new Notice('PwnDoc Importer: select at least one note and one section.'); return; }
+                this.close();
+                await this.plugin.bulkSync(audit, rows, [...selected], direction, !!forceBox?.checked);
+            };
+            const push = btn(bar, 'Push selected sections', run('push'));
+            push.addClass('mod-cta');
+            push.style.marginLeft = 'auto';
+            btn(bar, 'Pull selected sections', run('pull'));
+        }
+
+        const block = (title, items, render) => {
+            if (!items.length) return;
+            contentEl.createEl('h4', { text: `${title} (${items.length})` });
+            for (const it of items) render(line(contentEl), it);
+        };
+        block('Orphan notes', data.orphans, (l, o) => {
+            const t = l.createEl('span', { text: o.path });
+            t.style.flex = '1';
+            l.createEl('small', { text: o.reason, cls: 'pwndoc-meta' });
+            btn(l, 'Open', () => open(o.path));
+            btn(l, 'Unlink', async () => { if (await this.plugin.unlinkNote(this.app.vault.getAbstractFileByPath(o.path))) l.remove(); });
+        });
+        block('Notes without a finding', data.unlinked, (l, n) => {
+            const t = l.createEl('span', { text: n.path });
+            t.style.flex = '1';
+            btn(l, 'Open', () => open(n.path));
+        });
+        block('Findings on PwnDoc without a note', data.missing, (l, f) => {
+            const t = l.createEl('span', { text: f.title });
+            t.style.flex = '1';
+            l.createEl('small', { text: `#${f.identifier ?? ''}`, cls: 'pwndoc-meta' });
+        });
+        if (data.missing.length && audit) {
+            btn(contentEl, 'Import the missing findings...', () => { this.close(); this.plugin.importFindingsFromPwndoc(undefined, audit._id); }).style.marginTop = '8px';
+        }
+        if (!data.rows.length && !data.orphans.length && !data.unlinked.length && !data.missing.length) {
+            contentEl.createEl('p', { text: 'Nothing to show.' });
+        }
+    }
+
+    onClose() { this.contentEl.empty(); }
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 class PwnDocImporterPlugin extends Plugin {
     async onload() {
         await this.loadSettings();
+        this.remoteWarn = new Map();   // note path -> sections PwnDoc changed since the last sync
+        this.remoteSeen = new Map();   // note path -> last warned signature
+        this.checking = new Set();
         this.addSettingTab(new PwnDocSettingTab(this.app, this));
         this.addRibbonIcon('shield-plus', 'Add vulnerability (PwnDoc)', () => {
             new ImportSourceModal(this.app, source => {
@@ -2158,6 +2394,23 @@ class PwnDocImporterPlugin extends Plugin {
             name: 'Refresh engagement attribute on notes',
             callback: () => this.refreshEngagementAttributes(),
         });
+        const cmd = (id, name, callback) => this.addCommand({ id, name, callback });
+        cmd('engagement-dashboard', 'Engagement dashboard (sync status of every note)', () => this.openDashboard());
+        cmd('lint-note', 'Lint this note before pushing', () => this.lintCurrentNote());
+        cmd('unlink-note', 'Unlink note from its PwnDoc finding', () => this.unlinkNote());
+        cmd('find-orphans', 'Find orphan notes (finding or engagement gone from PwnDoc)', () => this.findOrphans());
+        cmd('finding-completed', 'Mark PwnDoc finding as completed', () => this.setCompleted(true));
+        cmd('finding-reopen', 'Reopen PwnDoc finding (in progress)', () => this.setCompleted(false));
+        cmd('generate-report', 'Generate PwnDoc report (choose template)', () => this.generateReportCommand());
+        this.addCommand({
+            id: 'paste-image-with-caption',
+            name: 'Paste clipboard image with numbered caption',
+            editorCallback: (editor, view) => this.pasteImageWithCaption(editor, view),
+        });
+        this.registerEvent(this.app.workspace.on('file-open', f => f && this.checkRemote(f)));
+        if (this.settings.watchIntervalMin > 0) {
+            this.registerInterval(window.setInterval(() => this.checkRemote(this.app.workspace.getActiveFile()), this.settings.watchIntervalMin * 60000));
+        }
         const refresh = () => this.refreshChrome();
         this.registerEvent(this.app.workspace.on('file-open', refresh));
         this.registerEvent(this.app.workspace.on('active-leaf-change', refresh));
@@ -2166,6 +2419,8 @@ class PwnDocImporterPlugin extends Plugin {
             if (file.children === undefined) return;
             menu.addItem(i => i.setTitle('Associate to PwnDoc engagement').setIcon('shield-plus')
                 .onClick(() => this.associateFolder(file.path === '/' ? '' : file.path)));
+            menu.addItem(i => i.setTitle('Engagement dashboard').setIcon('layout-dashboard')
+                .onClick(() => this.openDashboard(file.path === '/' ? '' : file.path)));
             menu.addItem(i => i.setTitle('Import findings from PwnDoc here').setIcon('download')
                 .onClick(() => this.importFindingsFromPwndoc(file.path === '/' ? '' : file.path)));
         }));
@@ -2437,7 +2692,9 @@ class PwnDocImporterPlugin extends Plugin {
         const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
         const entry = file && folderAuditFor(file.path, this.settings.folderAudits);
         const st = file ? engagementStatus(fm, entry) : { text: '', linked: false };
-        this.statusEl.setText(st.text);
+        const warn = file && this.remoteWarn.get(file.path);
+        this.statusEl.setText(st.text + (warn?.length ? ` · changed on PwnDoc: ${warn.map(k => labelOf(defOf(k))).join(', ')}` : ''));
+        this.statusEl.style.color = warn?.length ? 'var(--text-warning)' : '';
         this.statusEl.style.display = st.text ? '' : 'none';
         this.statusEl.title = st.text ? 'PwnDoc Importer: click for quick actions' : '';
         if (!view) return;
@@ -2473,6 +2730,14 @@ class PwnDocImporterPlugin extends Plugin {
         item('Create PwnDoc finding for this note', 'plus-circle', () => this.createFindingForNote());
         item('Import findings that exist only on PwnDoc', 'download', () => this.importFindingsFromPwndoc());
         item('Sync history (rollback)', 'history', () => this.rollbackFromHistory());
+        item('Mark finding as completed', 'check-circle', () => this.setCompleted(true));
+        item('Reopen finding', 'rotate-ccw', () => this.setCompleted(false));
+        item('Lint this note', 'list-checks', () => this.lintCurrentNote());
+        item('Unlink from finding', 'unlink', () => this.unlinkNote());
+        menu.addSeparator();
+        item('Engagement dashboard', 'layout-dashboard', () => this.openDashboard());
+        item('Find orphan notes', 'search-x', () => this.findOrphans());
+        item('Generate report', 'file-output', () => this.generateReportCommand());
         menu.addSeparator();
         item('Associate folder to engagement', 'folder-plus', () => this.associateFolder());
         item('Refresh engagement attribute on notes', 'refresh-cw', () => this.refreshEngagementAttributes());
@@ -2524,6 +2789,7 @@ class PwnDocImporterPlugin extends Plugin {
             mdToHtml: md => mdToHtml(app, md, true),
             htmlToMd,
             cfLabels: this.cfLabels || {},
+            cfTypes: this.cfTypes || {},
             resolvePath: src => (app.metadataCache.getFirstLinkpathDest(src, file.path)
                 ?? app.vault.getAbstractFileByPath(normalizePath(`${parentDir(file.path)}/${src}`)))?.path ?? null,
             readBinary: async p => Buffer.from(await adapter.readBinary(p)),
@@ -2558,6 +2824,7 @@ class PwnDocImporterPlugin extends Plugin {
         const { auditId, findingId } = link;
 
         let audit, finding, rows, noteMd;
+        await this.loadCustomFieldDefs();
         const ctx = this.syncCtx(file, findingId, auditId);
         try {
             ({ audit, finding } = await fetchFinding(ctx, auditId, findingId));
@@ -2570,6 +2837,7 @@ class PwnDocImporterPlugin extends Plugin {
             auditState: audit.state,
             onApply: async ({ push, pull, merge, force }) => {
                 try {
+                    if (push.length && !(await this.lintGate(file, noteMd, push, audit.language, ctx))) return;
                     if (Object.keys(merge).length) {
                         const r = await applyMerged(ctx, { auditId, findingId, noteMd, merged: merge, snapshotFinding: finding, force });
                         await this.app.vault.modify(file, r.noteMd);
@@ -2584,6 +2852,7 @@ class PwnDocImporterPlugin extends Plugin {
                         await this.applyPullMeta(file, r.meta);
                     }
                     new Notice(`PwnDoc Importer: pushed ${push.length}, pulled ${pull.length}, merged ${Object.keys(merge).length} section(s).`);
+                    this.checkRemote(file);
                 } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
             },
         }).open();
@@ -2625,6 +2894,8 @@ class PwnDocImporterPlugin extends Plugin {
 
     // Title and CVSS pulled from PwnDoc: rename the note (keeping its VT-NN prefix) and refresh the frontmatter
     async applyPullMeta(file, meta) {
+        const upd = metaToFrontmatter(meta, this.app.metadataCache.getFileCache(file)?.frontmatter);
+        if (Object.keys(upd).length) await this.app.fileManager.processFrontMatter(file, fm => Object.assign(fm, upd));
         if (meta.cvssv3 !== undefined) {
             if (isValidCvss31(meta.cvssv3)) {
                 await this.app.fileManager.processFrontMatter(file, fm => Object.assign(fm, cvssFrontmatter(meta.cvssv3)));
@@ -2679,13 +2950,10 @@ class PwnDocImporterPlugin extends Plugin {
     }
 
     // Findings that exist on PwnDoc but have no note in the vault: create the notes from them (download only)
-    async importFindingsFromPwndoc(folderArg) {
+    async importFindingsFromPwndoc(folderArg, auditIdArg) {
         const active = this.app.workspace.getActiveFile();
         try {
-            let auditId = folderArg !== undefined
-                ? folderAuditFor(`${folderArg ? folderArg + '/' : ''}x.md`, this.settings.folderAudits)?.auditId
-                : active ? resolveAuditId(active.path, this.app.metadataCache.getFileCache(active)?.frontmatter, this.settings.folderAudits) : null;
-            if (!auditId) auditId = (await this.pickAudit())?._id;
+            const auditId = auditIdArg ?? await this.currentAuditId(folderArg);
             if (!auditId) return;
 
             const audit = await this.api('GET', `/api/audits/${auditId}`);
@@ -2712,6 +2980,248 @@ class PwnDocImporterPlugin extends Plugin {
             }
             new Notice(`PwnDoc Importer: imported ${n} finding(s) from "${audit.name}".`);
         } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+    }
+
+    // ── Dashboard, bulk sync, orphans, unlink ────────────────────────────────────
+
+    // Engagement of the open note, or of the folder given, else ask
+    async currentAuditId(folderArg) {
+        const active = this.app.workspace.getActiveFile();
+        const id = folderArg !== undefined
+            ? folderAuditFor(`${folderArg ? folderArg + '/' : ''}x.md`, this.settings.folderAudits)?.auditId
+            : active ? resolveAuditId(active.path, this.app.metadataCache.getFileCache(active)?.frontmatter, this.settings.folderAudits) : null;
+        return id || (await this.pickAudit())?._id || null;
+    }
+
+    // id -> label and id -> field type of the PwnDoc custom fields, needed to read and write them
+    async loadCustomFieldDefs() {
+        if (this.cfTypes) return;
+        try {
+            const defs = (await this.api('GET', '/api/data/custom-fields')) || [];
+            this.cfLabels = { ...Object.fromEntries(defs.map(d => [d._id, d.label])), ...this.cfLabels };
+            this.cfTypes = Object.fromEntries(defs.map(d => [d._id, d.fieldType]));
+        } catch (e) { this.dbg('custom field definitions not loaded:', e.message); }
+    }
+
+    // Notes of an engagement, with the text of the linked ones
+    async notesOfAudit(auditId) {
+        const out = [];
+        for (const f of this.app.vault.getMarkdownFiles()) {
+            const fm = this.app.metadataCache.getFileCache(f)?.frontmatter || {};
+            if (resolveAuditId(f.path, fm, this.settings.folderAudits) !== auditId) continue;
+            if (!fm.pwndoc_finding_id && !/^(VT|M)-\d+ - /.test(f.basename)) continue;
+            out.push({ path: f.path, basename: f.basename, fm, md: fm.pwndoc_finding_id ? await this.app.vault.cachedRead(f) : '' });
+        }
+        return out;
+    }
+
+    linkedFindingIds() {
+        return new Set(this.app.vault.getMarkdownFiles()
+            .map(f => this.app.metadataCache.getFileCache(f)?.frontmatter?.pwndoc_finding_id).filter(Boolean));
+    }
+
+    async openDashboard(folderArg) {
+        const notice = new Notice('PwnDoc Importer: reading the engagement…', 0);
+        try {
+            const auditId = await this.currentAuditId(folderArg);
+            if (!auditId) return;
+            await this.loadCustomFieldDefs();
+            const audit = await this.api('GET', `/api/audits/${auditId}`);
+            const data = await buildDashboard(
+                (n, findingId) => this.syncCtx(this.app.vault.getAbstractFileByPath(n.path), findingId, auditId),
+                { audit, notes: await this.notesOfAudit(auditId), linkedIds: this.linkedFindingIds(),
+                  loadBase: id => loadBase(this.app.vault.adapter, historyDir(this.manifest.dir, id)) });
+            new DashboardModal(this.app, this, data, { title: `${audit.name} (${audit.state})`, audit }).open();
+        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+        finally { notice.hide(); }
+    }
+
+    // Push or pull the same sections of several notes; per note, only what bulkPlan allows
+    async bulkSync(audit, rows, sections, direction, force) {
+        const done = [], skipped = [], failed = [];
+        for (const row of rows) {
+            const file = this.app.vault.getAbstractFileByPath(row.path);
+            const plan = bulkPlan(row, direction, sections);
+            if (plan.blocked.length) skipped.push(`${row.title}: ${plan.blocked.map(b => `${b.key} (${b.why})`).join(', ')}`);
+            if (!file || !plan.run.length) continue;
+            try {
+                const ctx = this.syncCtx(file, row.findingId, audit._id);
+                const noteMd = await this.app.vault.read(file);
+                if (direction === 'push') {
+                    const err = lintNote(noteMd, { sections: plan.run, fm: ctx.noteInfo.fm, basename: file.basename, locale: audit.language, exists: s => !!ctx.resolvePath(s) })
+                        .find(i => i.level === 'error');
+                    if (err) throw new Error(`lint: ${err.message}`);
+                    await pushSections(ctx, { auditId: audit._id, findingId: row.findingId, noteMd, sections: plan.run, snapshotFinding: audit.findings.find(f => f._id === row.findingId), force });
+                } else {
+                    const r = await pullSections(ctx, { auditId: audit._id, findingId: row.findingId, noteMd, sections: plan.run });
+                    await this.app.vault.modify(file, r.noteMd);
+                    await this.applyPullMeta(file, r.meta);
+                }
+                done.push(row.title);
+            } catch (e) { failed.push(`${row.title}: ${e.message}`); console.error(e); }
+        }
+        const text = [`${direction === 'push' ? 'Pushed' : 'Pulled'} ${done.length} note(s).`,
+            ...(skipped.length ? [`Skipped (not overwriting the other side):`, ...skipped] : []),
+            ...(failed.length ? ['Failed:', ...failed] : [])].join('\n');
+        new Notice(`PwnDoc Importer: ${text}`, skipped.length || failed.length ? 15000 : 5000);
+        console.log('[PwnDoc Importer] bulk', direction, { done, skipped, failed });
+    }
+
+    // Remove the finding link (the engagement attribute stays). Returns true when done.
+    async unlinkNote(file) {
+        file ||= this.app.workspace.getActiveFile();
+        const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
+        if (!fm?.pwndoc_finding_id) { new Notice('PwnDoc Importer: this note is not linked to a finding.'); return false; }
+        if (!(await new Promise(r => new ConfirmModal(this.app, `Unlink "${file.basename}" from its PwnDoc finding? The note and the finding stay as they are; the sync history is kept.`, r).open()))) return false;
+        await this.app.fileManager.processFrontMatter(file, f => { delete f.pwndoc_finding_id; });
+        this.remoteWarn.delete(file.path);
+        new Notice('PwnDoc Importer: note unlinked.');
+        return true;
+    }
+
+    // Notes of the whole vault whose finding or engagement no longer exists on PwnDoc
+    async findOrphans() {
+        const notice = new Notice('PwnDoc Importer: checking linked notes…', 0);
+        try {
+            const byAudit = new Map();
+            for (const f of this.app.vault.getMarkdownFiles()) {
+                const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
+                const auditId = fm?.pwndoc_finding_id && resolveAuditId(f.path, fm, this.settings.folderAudits);
+                if (auditId) (byAudit.get(auditId) || byAudit.set(auditId, []).get(auditId)).push({ path: f.path, fm });
+            }
+            const orphans = [];
+            for (const [auditId, notes] of byAudit) {
+                let audit = null;
+                try { audit = await this.api('GET', `/api/audits/${auditId}`); }
+                catch (e) { if (!/HTTP (404|500)/.test(e.message)) throw e; }
+                for (const n of notes) {
+                    const reason = orphanReason(n.fm, audit);
+                    if (reason) orphans.push({ path: n.path, findingId: n.fm.pwndoc_finding_id, reason });
+                }
+            }
+            new DashboardModal(this.app, this, { rows: [], orphans, unlinked: [], missing: [] }, { title: 'Orphan notes', audit: null }).open();
+        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+        finally { notice.hide(); }
+    }
+
+    // ── Lint, remote changes, completion status, report, figures ─────────────────
+
+    // false when the push must not go on: errors block, warnings ask
+    async lintGate(file, md, keys, locale, ctx) {
+        const issues = lintNote(md, { sections: keys, fm: ctx.noteInfo.fm, basename: file.basename, locale, exists: s => !!ctx.resolvePath(s) });
+        if (!issues.length) return true;
+        return new Promise(resolve => new LintModal(this.app, issues, resolve).open());
+    }
+
+    async lintCurrentNote() {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) { new Notice('PwnDoc Importer: open a note first.'); return; }
+        const md = await this.app.vault.read(file);
+        const ctx = this.syncCtx(file, '', '');
+        const body = Object.keys(parseSections(md)).filter(k => !defOf(k).source && k !== 'customFields');
+        const locale = ctx.noteInfo.fm.locale || '';
+        new LintModal(this.app, lintNote(md, { sections: [...body, 'title', 'cvssv3', 'vulnType', 'priority', 'remediationComplexity'],
+            fm: ctx.noteInfo.fm, basename: file.basename, locale, exists: s => !!ctx.resolvePath(s) }), null).open();
+    }
+
+    hasCredentials() {
+        const s = this.settings;
+        return !!(s.apiUrl && s.apiUsername && getApiPassword(this.app, s));
+    }
+
+    // Has PwnDoc changed a synced section since the last sync of this note? Never prompts, never writes.
+    async checkRemote(file) {
+        if (!this.settings.watchRemote || !file || file.extension !== 'md' || !this.hasCredentials()) return;
+        const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+        const link = resolveFindingLink(file.path, fm, this.settings.folderAudits);
+        if (!link || this.checking.has(file.path)) return;
+        this.checking.add(file.path);
+        try {
+            await this.loadCustomFieldDefs();
+            const ctx = this.syncCtx(file, link.findingId, link.auditId);
+            const base = await loadBase(ctx.adapter, ctx.historyDir);
+            if (!base) { this.remoteWarn.delete(file.path); return; }
+            const { finding } = await fetchFinding(ctx, link.auditId, link.findingId);
+            const rows = await buildComparison(ctx, await this.app.vault.cachedRead(file), finding, SECTION_DEFS.map(d => d.key), ctx.noteInfo, base);
+            const keys = remoteChanges(rows);
+            if (keys.length) this.remoteWarn.set(file.path, keys); else this.remoteWarn.delete(file.path);
+            const sig = keys.join(',');
+            if (keys.length && this.remoteSeen.get(file.path) !== sig) {
+                this.remoteSeen.set(file.path, sig);
+                new Notice(`PwnDoc Importer: "${file.basename}" changed on PwnDoc (${keys.map(k => labelOf(defOf(k))).join(', ')}). Compare before you push.`, 8000);
+            }
+            if (!keys.length) this.remoteSeen.delete(file.path);
+        } catch (e) { this.dbg('remote check failed:', e.message); }
+        finally { this.checking.delete(file.path); this.refreshChrome(); }
+    }
+
+    // Mark the finding of the open note completed (or open again) on PwnDoc and mirror it in the frontmatter
+    async setCompleted(completed) {
+        const file = this.app.workspace.getActiveFile();
+        const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
+        const link = file && resolveFindingLink(file.path, fm, this.settings.folderAudits);
+        if (!link) { new Notice('PwnDoc Importer: associate this note to a finding first.'); return; }
+        try {
+            const ctx = this.syncCtx(file, link.findingId, link.auditId);
+            const args = { ...link, completed, localBefore: await this.app.vault.read(file) };
+            try { await setFindingStatus(ctx, { ...args, force: false }); }
+            catch (e) {
+                if (!(e instanceof AuditLockedError) || !(await new Promise(r => new ConfirmModal(this.app, `${e.message}. Enforce this change?`, r).open()))) throw e;
+                await setFindingStatus(ctx, { ...args, force: true });
+            }
+            const upd = metaToFrontmatter({ status: completed ? 'completed' : 'in progress' }, fm);
+            if (Object.keys(upd).length) await this.app.fileManager.processFrontMatter(file, f => Object.assign(f, upd));
+            new Notice(`PwnDoc Importer: finding ${completed ? 'marked as completed' : 'reopened'} on PwnDoc.`);
+            this.checkRemote(file);
+        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+    }
+
+    // Generate the report of an engagement with a template of the user's choice and save it in the vault
+    async generateReportCommand() {
+        try {
+            const auditId = await this.currentAuditId();
+            if (!auditId) return;
+            const [audit, templates] = await Promise.all([this.api('GET', `/api/audits/${auditId}`), this.api('GET', '/api/templates')]);
+            if (!templates?.length) { new Notice('PwnDoc Importer: PwnDoc has no report templates.'); return; }
+            const current = audit.template?._id ?? audit.template ?? null;
+            const templateId = await new Promise(r => new TemplatePickModal(this.app, templates, current, r).open());
+            if (!templateId) return;
+            const force = templateId !== current && audit.state !== 'EDIT'
+                && await new Promise(r => new ConfirmModal(this.app, `Changing the template of an audit in state ${audit.state} is a write. Enforce? The original template is put back right after.`, r).open());
+            if (templateId !== current && audit.state !== 'EDIT' && !force) return;
+
+            const notice = new Notice('PwnDoc Importer: generating the report…', 0);
+            let r;
+            try { r = await generateReport({ api: (m, p, o) => this.api(m, p, o) }, { auditId, templateId, force }); }
+            finally { notice.hide(); }
+            const adapter = this.app.vault.adapter;
+            const folder = this.settings.reportsFolder;
+            if (folder && !(await adapter.exists(folder))) await adapter.mkdir(folder);
+            const path = normalizePath(`${folder ? folder + '/' : ''}${reportFileName(audit.name, r.ext)}`);
+            await adapter.writeBinary(path, r.buf.buffer.slice(r.buf.byteOffset, r.buf.byteOffset + r.buf.byteLength));
+            new Notice(`PwnDoc Importer: report saved to ${path}`);
+            this.app.openWithDefaultApp?.(path);
+        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+    }
+
+    // Clipboard image into the attachments folder, linked at the cursor with its numbered caption
+    async pasteImageWithCaption(editor, view) {
+        let img;
+        try { img = require('electron').clipboard.readImage(); }
+        catch { new Notice('PwnDoc Importer: the clipboard is not available here.'); return; }
+        if (img.isEmpty()) { new Notice('PwnDoc Importer: there is no image in the clipboard.'); return; }
+        const file = view.file;
+        const caption = await new Promise(r => new PromptModal(this.app, 'Figure caption', 'e.g. Login request intercepted in Burp', r).open());
+        if (!caption) return;
+        const png = img.toPNG();
+        if (png.length > MAX_IMAGE_BYTES) new Notice('PwnDoc Importer: the image is above 12 MB, PwnDoc will refuse it on push.');
+        const adapter = this.app.vault.adapter;
+        const folder = this.settings.attachmentsFolder;
+        if (folder && !(await adapter.exists(folder))) await adapter.mkdir(folder);
+        const path = normalizePath(`${folder ? folder + '/' : ''}${pastedImageName(file.basename)}`);
+        await adapter.writeBinary(path, png.buffer.slice(png.byteOffset, png.byteOffset + png.byteLength));
+        const locale = this.app.metadataCache.getFileCache(file)?.frontmatter?.locale || '';
+        editor.replaceSelection(`![](${encodeURI(path)})\n${figureCaption(locale, nextFigureNumber(editor.getValue()), caption)}\n`);
     }
 
     // Step 2 — ask VT or M
@@ -2868,7 +3378,7 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
+module.exports.__test = { bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
     sideBySide, missingFindings, findingToNoteRow, IMPORT_SECTIONS, folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,

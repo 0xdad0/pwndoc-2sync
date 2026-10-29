@@ -1105,3 +1105,26 @@ test('reportFileName strips what a path cannot hold; pastedImageName is unique p
     assert.equal(T.reportFileName('Acme: web/app', 'docx', new Date('2026-10-29T10:00:00Z')), 'Acme- web-app - 2026-10-29.docx');
     assert.equal(T.pastedImageName('VT-01 - XSS', new Date('2026-10-29T10:11:12Z')), 'VT-01 - XSS 20261029101112.png');
 });
+
+test('bulkPlan pushes what the note changed, pulls what PwnDoc changed, and refuses to overwrite the other side', () => {
+    const row = { sections: {
+        poc: { status: 'local', localEmpty: false }, description: { status: 'remote', localEmpty: false },
+        scope: { status: 'conflict', localEmpty: false }, remediation: { status: 'unknown', localEmpty: true },
+        observation: { status: 'unknown', localEmpty: false }, title: { status: 'same', localEmpty: false },
+    } };
+    const keys = ['poc', 'description', 'scope', 'remediation', 'observation', 'title', 'priority'];
+    assert.deepEqual(T.bulkPlan(row, 'push', keys), { run: ['poc', 'observation'], blocked: [
+        { key: 'description', why: 'remote' }, { key: 'scope', why: 'conflict' }, { key: 'remediation', why: 'note empty' }] });
+    assert.deepEqual(T.bulkPlan(row, 'pull', keys), { run: ['description', 'remediation'], blocked: [
+        { key: 'poc', why: 'local' }, { key: 'scope', why: 'conflict' }, { key: 'observation', why: 'note has content, no sync base' }] });
+});
+
+test('buildDashboard rows carry the per-section status and take a ctx per note', async () => {
+    const audit = { _id: 'A1', findings: [{ _id: 'f1', title: 'One', status: 1, poc: '<p>x</p>', description: '', observation: '', scope: '', remediation: '', references: [], customFields: [] }] };
+    const seen = [];
+    const d = await T.buildDashboard(n => { seen.push(n.path); return cmpCtx; }, { audit, linkedIds: new Set(['f1']), loadBase: async () => null,
+        notes: [{ path: 'a.md', basename: 'VT-01 - One', fm: { pwndoc_finding_id: 'f1' }, md: '## Evidenza\n\nx\n' }] });
+    assert.deepEqual(seen, ['a.md']);
+    assert.deepEqual(d.rows[0].sections.poc, { status: 'same', localEmpty: false });
+    assert.equal(d.rows[0].completed, false);
+});
