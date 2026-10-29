@@ -1,9 +1,9 @@
 {
   "id": "pwndoc-importer",
-  "name": "PwnDoc Importer",
-  "version": "1.5.1",
+  "name": "PwnDoc 2Sync",
+  "version": "1.6.0",
   "minAppVersion": "1.11.5",
-  "description": "Import vulnerabilities from a PwnDoc CSV export and create notes matching your VT-XX template.",
+  "description": "Two-way sync between Obsidian finding notes and a PwnDoc engagement: send, compare, merge, rollback, report generation, plus vulnerability import.",
   "author": "davide.caputo",
   "isDesktopOnly": true
 }

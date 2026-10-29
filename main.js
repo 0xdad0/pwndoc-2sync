@@ -1635,7 +1635,7 @@ class PwnDocSettingTab extends PluginSettingTab {
     display() {
         const { containerEl } = this;
         containerEl.empty();
-        containerEl.createEl('h2', { text: 'PwnDoc Importer' });
+        containerEl.createEl('h2', { text: 'PwnDoc 2Sync' });
 
         new Setting(containerEl)
             .setName('CSV file path')
@@ -2083,11 +2083,11 @@ class MergeModal extends Modal {
             const push = keysOf('note');
             const pull = keysOf('pwndoc');
             const merge = Object.fromEntries(ui.filter(u => u.value() === 'merge').map(u => [u.row.key, u.area.value]));
-            if (!push.length && !pull.length && !Object.keys(merge).length) { new Notice('PwnDoc Importer: nothing selected.'); return; }
+            if (!push.length && !pull.length && !Object.keys(merge).length) { new Notice('PwnDoc 2Sync: nothing selected.'); return; }
             const bad = Object.entries(merge).find(([, t]) => hasConflictMarkers(t));
-            if (bad) { new Notice(`PwnDoc Importer: resolve the conflict markers in "${labelOf(defOf(bad[0]))}" first.`); return; }
+            if (bad) { new Notice(`PwnDoc 2Sync: resolve the conflict markers in "${labelOf(defOf(bad[0]))}" first.`); return; }
             if ((push.length || Object.keys(merge).length) && this.auditState !== 'EDIT' && !forceBox?.checked) {
-                new Notice(`PwnDoc Importer: audit is ${this.auditState}, tick "Enforce" to write to PwnDoc.`);
+                new Notice(`PwnDoc 2Sync: audit is ${this.auditState}, tick "Enforce" to write to PwnDoc.`);
                 return;
             }
             this.close();
@@ -2191,8 +2191,8 @@ class RollbackModal extends Modal {
         apply.style.marginTop = '10px';
         apply.onclick = () => {
             const sections = ui.filter(u => u.check.checked).map(u => u.row.key);
-            if (!sections.length) { new Notice('PwnDoc Importer: nothing selected.'); return; }
-            if (guarded && !forceBox.checked) { new Notice(`PwnDoc Importer: audit is ${this.auditState}, tick "Enforce" to restore.`); return; }
+            if (!sections.length) { new Notice('PwnDoc 2Sync: nothing selected.'); return; }
+            if (guarded && !forceBox.checked) { new Notice(`PwnDoc 2Sync: audit is ${this.auditState}, tick "Enforce" to restore.`); return; }
             this.close();
             this.onApply({ sections, force: !!forceBox?.checked });
         };
@@ -2382,7 +2382,7 @@ class DashboardModal extends Modal {
             }
             const run = direction => async () => {
                 const rows = checks.filter(x => x.c.checked).map(x => x.row);
-                if (!rows.length || !selected.size) { new Notice('PwnDoc Importer: select at least one note and one section.'); return; }
+                if (!rows.length || !selected.size) { new Notice('PwnDoc 2Sync: select at least one note and one section.'); return; }
                 this.close();
                 await this.plugin.bulkSync(audit, rows, [...selected], direction, !!forceBox?.checked);
             };
@@ -2551,24 +2551,24 @@ class PwnDocImporterPlugin extends Plugin {
     async saveSettings() { await this.saveData(this.settings); }
 
     dbg(...args) {
-        if (this.settings.debugMode) console.log('[PwnDoc Importer]', ...args);
+        if (this.settings.debugMode) console.log('[PwnDoc 2Sync]', ...args);
     }
 
     // Step 1 — load CSV and open vuln search
     async openSearchModal({ quick = false } = {}) {
         const { csvPath } = this.settings;
         if (!csvPath) {
-            new Notice('PwnDoc Importer: set the CSV path in Settings first.');
+            new Notice('PwnDoc 2Sync: set the CSV path in Settings first.');
             return;
         }
 
         let text;
         try { text = await readFilePath(this.app, csvPath); }
-        catch (e) { new Notice(`PwnDoc Importer: cannot read CSV — ${e.message}`); return; }
+        catch (e) { new Notice(`PwnDoc 2Sync: cannot read CSV — ${e.message}`); return; }
 
         let rows = parseCSV(text);
         if (rows.length === 0) {
-            new Notice('PwnDoc Importer: CSV is empty or could not be parsed.');
+            new Notice('PwnDoc 2Sync: CSV is empty or could not be parsed.');
             return;
         }
 
@@ -2579,7 +2579,7 @@ class PwnDocImporterPlugin extends Plugin {
     quickImport() {
         if (this.settings.quickImportSource === 'api') {
             if (!this.settings.apiUrl || !this.settings.apiUsername || !getApiPassword(this.app, this.settings)) {
-                new Notice('PwnDoc Importer: save API credentials in Settings to use the quick API import.');
+                new Notice('PwnDoc 2Sync: save API credentials in Settings to use the quick API import.');
                 return;
             }
             const { apiUrl: url, apiUsername: username, apiIgnoreSsl: ignoreSsl } = this.settings;
@@ -2596,7 +2596,7 @@ class PwnDocImporterPlugin extends Plugin {
         const openSearch = locale => {
             const filtered = locale ? rows.filter(r => r.locale === locale) : rows;
             if (filtered.length === 0) {
-                new Notice(`PwnDoc Importer: no vulnerabilities found for locale "${locale}".`);
+                new Notice(`PwnDoc 2Sync: no vulnerabilities found for locale "${locale}".`);
                 return;
             }
             new VulnSearchModal(this.app, filtered, vuln => this.askPrefix(vuln)).open();
@@ -2604,7 +2604,7 @@ class PwnDocImporterPlugin extends Plugin {
         if (quick) {
             const pref = this.settings.quickImportLocale || '';
             if (pref && !locales.includes(pref)) {
-                new Notice(`PwnDoc Importer: locale "${pref}" not present in the data — showing all locales.`);
+                new Notice(`PwnDoc 2Sync: locale "${pref}" not present in the data — showing all locales.`);
                 return openSearch('');
             }
             return openSearch(pref);
@@ -2629,13 +2629,13 @@ class PwnDocImporterPlugin extends Plugin {
             await this.saveSettings();
         }
         const dbg = this.dbg.bind(this);
-        const notice = new Notice('PwnDoc Importer: connecting…', 0);
+        const notice = new Notice('PwnDoc 2Sync: connecting…', 0);
         let rows;
         try {
             dbg('logging in to', url);
             const token = await pwndocLogin(url, username, password, ignoreSsl);
             dbg('login OK, fetching vuln list + custom fields');
-            notice.setMessage('PwnDoc Importer: fetching vulnerability list…');
+            notice.setMessage('PwnDoc 2Sync: fetching vulnerability list…');
             const [list, cfLabels] = await Promise.all([
                 pwndocFetchVulns(url, token, ignoreSsl),
                 pwndocFetchCustomFields(url, token, ignoreSsl, dbg).catch(e => { dbg('custom fields fetch failed:', e.message); return {}; }),
@@ -2643,7 +2643,7 @@ class PwnDocImporterPlugin extends Plugin {
             dbg(`list returned ${list.length} vulns, ${Object.keys(cfLabels).length} custom field definitions`);
 
             const details = await pwndocFetchAllDetails(url, token, ignoreSsl, list, dbg, (done, total) => {
-                notice.setMessage(`PwnDoc Importer: fetching details ${done}/${total}…`);
+                notice.setMessage(`PwnDoc 2Sync: fetching details ${done}/${total}…`);
             });
             notice.hide();
 
@@ -2651,10 +2651,10 @@ class PwnDocImporterPlugin extends Plugin {
             this.cfLabels = cfLabels;
             rows = flattenVulnsFromApi(details, cfLabels);
             dbg(`flattened to ${rows.length} rows; sample keys:`, rows[0] ? Object.keys(rows[0]) : []);
-            if (rows.length === 0) { new Notice('PwnDoc Importer: no vulnerabilities returned from API.'); return; }
+            if (rows.length === 0) { new Notice('PwnDoc 2Sync: no vulnerabilities returned from API.'); return; }
         } catch (e) {
             notice.hide();
-            new Notice(`PwnDoc Importer: ${e.message}`);
+            new Notice(`PwnDoc 2Sync: ${e.message}`);
             console.error(e);
             return;
         }
@@ -2679,9 +2679,9 @@ class PwnDocImporterPlugin extends Plugin {
             if (csvPath) {
                 try {
                     require('fs').writeFileSync(csvPath, rowsToCsv(rows), 'utf8');
-                    new Notice(`PwnDoc Importer: CSV saved to ${csvPath}`);
+                    new Notice(`PwnDoc 2Sync: CSV saved to ${csvPath}`);
                 } catch (e) {
-                    new Notice(`PwnDoc Importer: could not save CSV — ${e.message}`);
+                    new Notice(`PwnDoc 2Sync: could not save CSV — ${e.message}`);
                     console.error(e);
                     // Continue anyway — don't block the import
                 }
@@ -2728,7 +2728,7 @@ class PwnDocImporterPlugin extends Plugin {
         return new Promise(async resolve => {
             let audits;
             try { audits = (await this.api('GET', '/api/audits')) || []; }
-            catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); return resolve(null); }
+            catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); return resolve(null); }
             new AuditPickModal(this.app, audits, resolve).open();
         });
     }
@@ -2762,7 +2762,7 @@ class PwnDocImporterPlugin extends Plugin {
             done++;
         }
         if (!quiet) {
-            new Notice(`PwnDoc Importer: "${folder || '/'}" → ${entry.name}; engagement written on ${done} note(s)`
+            new Notice(`PwnDoc 2Sync: "${folder || '/'}" → ${entry.name}; engagement written on ${done} note(s)`
                 + (skipped ? `, ${skipped} skipped (linked to a finding of another engagement)` : '') + '.');
         }
     }
@@ -2776,9 +2776,9 @@ class PwnDocImporterPlugin extends Plugin {
                 if (a) entry.name = a.name;
             }
             await this.saveSettings();
-        } catch (e) { new Notice(`PwnDoc Importer: names not refreshed (${e.message}), using the stored ones.`); }
+        } catch (e) { new Notice(`PwnDoc 2Sync: names not refreshed (${e.message}), using the stored ones.`); }
         for (const folder of Object.keys(this.settings.folderAudits)) await this.stampFolder(folder, { quiet: true });
-        new Notice('PwnDoc Importer: engagement attribute refreshed on all associated folders.');
+        new Notice('PwnDoc 2Sync: engagement attribute refreshed on all associated folders.');
     }
 
     // A note created in or moved into an associated folder gets the attribute too
@@ -2807,7 +2807,7 @@ class PwnDocImporterPlugin extends Plugin {
         this.statusEl.setText(st.text + (warn?.length ? ` · changed on PwnDoc: ${warn.map(k => labelOf(defOf(k))).join(', ')}` : ''));
         this.statusEl.style.color = warn?.length ? 'var(--text-warning)' : '';
         this.statusEl.style.display = st.text ? '' : 'none';
-        this.statusEl.title = st.text ? 'PwnDoc Importer: click for quick actions' : '';
+        this.statusEl.title = st.text ? 'PwnDoc 2Sync: click for quick actions' : '';
         if (!view) return;
 
         this.headerActions ||= new WeakMap();
@@ -2868,7 +2868,7 @@ class PwnDocImporterPlugin extends Plugin {
     // with Evidenza selected
     async sendToPwndoc() {
         const file = this.app.workspace.getActiveFile();
-        if (!file) { new Notice('PwnDoc Importer: open a note first.'); return; }
+        if (!file) { new Notice('PwnDoc 2Sync: open a note first.'); return; }
         if (this.app.metadataCache.getFileCache(file)?.frontmatter?.pwndoc_finding_id) return this.compareWithPwndoc();
         try {
             const auditId = await this.auditIdFor(file);
@@ -2882,25 +2882,25 @@ class PwnDocImporterPlugin extends Plugin {
                 fm.pwndoc_audit = audit.name;
                 fm.pwndoc_finding_id = choice.finding._id;
             });
-            new Notice(`PwnDoc Importer: linked to "${choice.finding.title}"`);
+            new Notice(`PwnDoc 2Sync: linked to "${choice.finding.title}"`);
             await this.compareWithPwndoc({ auditId, findingId: choice.finding._id });
-        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
     }
 
     async associateNote() {
         const file = this.app.workspace.getActiveFile();
-        if (!file) { new Notice('PwnDoc Importer: open a note first.'); return; }
+        if (!file) { new Notice('PwnDoc 2Sync: open a note first.'); return; }
         const auditId = await this.auditIdFor(file);
         if (!auditId) return;
         let audit;
         try { audit = await this.api('GET', `/api/audits/${auditId}`); }
-        catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); return; }
+        catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); return; }
         const title = titleFromBasename(file.basename);
         if (!matchFinding(title, audit.findings || [])
             && await new Promise(r => new ConfirmModal(this.app, `No finding titled "${title}" in this audit. Create it now?`, r).open())) {
             return this.createFindingForNote();
         }
-        if (!audit.findings?.length) { new Notice('PwnDoc Importer: this audit has no findings yet.'); return; }
+        if (!audit.findings?.length) { new Notice('PwnDoc 2Sync: this audit has no findings yet.'); return; }
         new FindingPickModal(this.app, audit.findings, title, async finding => {
             if (!finding) return;
             await this.app.fileManager.processFrontMatter(file, fm => {
@@ -2908,7 +2908,7 @@ class PwnDocImporterPlugin extends Plugin {
                 fm.pwndoc_audit = audit.name;
                 fm.pwndoc_finding_id = finding._id;
             });
-            new Notice(`PwnDoc Importer: linked to "${finding.title}"`);
+            new Notice(`PwnDoc 2Sync: linked to "${finding.title}"`);
         }).open();
     }
 
@@ -2954,9 +2954,9 @@ class PwnDocImporterPlugin extends Plugin {
     async compareWithPwndoc(override = {}) {
         const file = this.app.workspace.getActiveFile();
         const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
-        if (!file) { new Notice('PwnDoc Importer: open a note first.'); return; }
+        if (!file) { new Notice('PwnDoc 2Sync: open a note first.'); return; }
         const link = resolveFindingLink(file.path, fm, this.settings.folderAudits, override);
-        if (!link) { new Notice('PwnDoc Importer: associate this note to a finding first.'); return; }
+        if (!link) { new Notice('PwnDoc 2Sync: associate this note to a finding first.'); return; }
         const { auditId, findingId } = link;
 
         let audit, finding, rows, noteMd;
@@ -2966,7 +2966,7 @@ class PwnDocImporterPlugin extends Plugin {
             ({ audit, finding } = await fetchFinding(ctx, auditId, findingId));
             noteMd = await this.app.vault.read(file);
             rows = await buildComparison(ctx, noteMd, finding, SECTION_DEFS.map(d => d.key), ctx.noteInfo, await loadBase(ctx.adapter, ctx.historyDir));
-        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); return; }
+        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); return; }
 
         new MergeModal(this.app, rows, {
             defaultKeys: DEFAULT_SYNC_SECTIONS,
@@ -2987,9 +2987,9 @@ class PwnDocImporterPlugin extends Plugin {
                         await this.app.vault.modify(file, r.noteMd);
                         await this.applyPullMeta(file, r.meta);
                     }
-                    new Notice(`PwnDoc Importer: pushed ${push.length}, pulled ${pull.length}, merged ${Object.keys(merge).length} section(s).`);
+                    new Notice(`PwnDoc 2Sync: pushed ${push.length}, pulled ${pull.length}, merged ${Object.keys(merge).length} section(s).`);
                     this.checkRemote(file);
-                } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+                } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
             },
         }).open();
     }
@@ -2997,13 +2997,13 @@ class PwnDocImporterPlugin extends Plugin {
     async rollbackFromHistory() {
         const file = this.app.workspace.getActiveFile();
         const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
-        if (!fm?.pwndoc_finding_id) { new Notice('PwnDoc Importer: associate this note to a finding first.'); return; }
+        if (!fm?.pwndoc_finding_id) { new Notice('PwnDoc 2Sync: associate this note to a finding first.'); return; }
         const auditId = resolveAuditId(file.path, fm, this.settings.folderAudits);
         const findingId = fm.pwndoc_finding_id;
         await this.loadCustomFieldDefs();
         const ctx = this.syncCtx(file, findingId, auditId);
         const entries = await listHistory(ctx.adapter, ctx.historyDir);
-        if (!entries.length) { new Notice('PwnDoc Importer: no history for this finding yet.'); return; }
+        if (!entries.length) { new Notice('PwnDoc 2Sync: no history for this finding yet.'); return; }
 
         new HistoryModal(this.app, entries, async ({ entry, side }) => {
             try {
@@ -3021,11 +3021,11 @@ class PwnDocImporterPlugin extends Plugin {
                                 const r = await rollbackSections(ctx, { entry, side, sections, noteMd: await this.app.vault.read(file), auditId, findingId, force });
                                 await this.app.vault.modify(file, r.noteMd);
                             }
-                            new Notice(`PwnDoc Importer: restored ${sections.length} section(s).`);
-                        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+                            new Notice(`PwnDoc 2Sync: restored ${sections.length} section(s).`);
+                        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
                     },
                 }).open();
-            } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+            } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
         }).open();
     }
 
@@ -3036,14 +3036,14 @@ class PwnDocImporterPlugin extends Plugin {
         if (meta.cvssv3 !== undefined) {
             if (isValidCvss31(meta.cvssv3)) {
                 await this.app.fileManager.processFrontMatter(file, fm => Object.assign(fm, cvssFrontmatter(meta.cvssv3)));
-            } else new Notice(`PwnDoc Importer: PwnDoc CVSS "${meta.cvssv3}" is not a 3.1 vector, frontmatter left unchanged.`);
+            } else new Notice(`PwnDoc 2Sync: PwnDoc CVSS "${meta.cvssv3}" is not a 3.1 vector, frontmatter left unchanged.`);
         }
         if (meta.title) {
             const prefix = file.basename.match(/^(VT|M)-\d+ - /)?.[0] || '';
             const dir = parentDir(file.path);
             const target = normalizePath(`${dir ? dir + '/' : ''}${prefix}${meta.title.replace(FILENAME_UNSAFE_RE, '-')}.md`);
             if (target === file.path) return;
-            if (this.app.vault.getAbstractFileByPath(target)) { new Notice(`PwnDoc Importer: cannot rename, "${target}" already exists.`); return; }
+            if (this.app.vault.getAbstractFileByPath(target)) { new Notice(`PwnDoc 2Sync: cannot rename, "${target}" already exists.`); return; }
             await this.app.fileManager.renameFile(file, target);
         }
     }
@@ -3051,7 +3051,7 @@ class PwnDocImporterPlugin extends Plugin {
     // Note without a finding: link an existing one with the same title, else create it from the library or from scratch
     async createFindingForNote(auditIdArg) {
         const file = this.app.workspace.getActiveFile();
-        if (!file) { new Notice('PwnDoc Importer: open a note first.'); return; }
+        if (!file) { new Notice('PwnDoc 2Sync: open a note first.'); return; }
         const fm = this.app.metadataCache.getFileCache(file)?.frontmatter || {};
         const auditId = auditIdArg ?? await this.auditIdFor(file);
         if (!auditId) return;
@@ -3062,7 +3062,7 @@ class PwnDocImporterPlugin extends Plugin {
             const existing = matchFinding(title, audit.findings || []);
             if (existing && await confirm(`The audit already has a finding titled "${existing.title}". Link this note to it instead of creating a new one?`)) {
                 await this.app.fileManager.processFrontMatter(file, f => { f.pwndoc_audit_id = auditId; f.pwndoc_audit = audit.name; f.pwndoc_finding_id = existing._id; });
-                new Notice(`PwnDoc Importer: linked to "${existing.title}"`);
+                new Notice(`PwnDoc 2Sync: linked to "${existing.title}"`);
                 return;
             }
 
@@ -3081,9 +3081,9 @@ class PwnDocImporterPlugin extends Plugin {
                 ts: new Date().toISOString(), op: 'create', forced: force, auditId, findingId, notePath: file.path,
                 sections: [], remoteBefore: null, localBefore: await this.app.vault.read(file),
             }, this.settings.historyLimit);
-            new Notice(`PwnDoc Importer: created "${body.title}"`);
+            new Notice(`PwnDoc 2Sync: created "${body.title}"`);
             await this.compareWithPwndoc({ auditId, findingId }); // opens the merge with Evidence preselected
-        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
     }
 
     // Findings that exist on PwnDoc but have no note in the vault: create the notes from them (download only)
@@ -3097,7 +3097,7 @@ class PwnDocImporterPlugin extends Plugin {
             const linked = new Set(this.app.vault.getMarkdownFiles()
                 .map(f => this.app.metadataCache.getFileCache(f)?.frontmatter?.pwndoc_finding_id).filter(Boolean));
             const missing = missingFindings(audit, linked);
-            if (!missing.length) { new Notice(`PwnDoc Importer: every finding of "${audit.name}" already has a note.`); return; }
+            if (!missing.length) { new Notice(`PwnDoc 2Sync: every finding of "${audit.name}" already has a note.`); return; }
 
             const picked = await new Promise(resolve => new MissingFindingsModal(this.app, missing, resolve).open());
             if (!picked?.length) return;
@@ -3115,8 +3115,8 @@ class PwnDocImporterPlugin extends Plugin {
                 await this.app.vault.modify(file, r.noteMd);
                 n++;
             }
-            new Notice(`PwnDoc Importer: imported ${n} finding(s) from "${audit.name}".`);
-        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+            new Notice(`PwnDoc 2Sync: imported ${n} finding(s) from "${audit.name}".`);
+        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
     }
 
     // ── Dashboard, bulk sync, orphans, unlink ────────────────────────────────────
@@ -3159,7 +3159,7 @@ class PwnDocImporterPlugin extends Plugin {
     }
 
     async openDashboard(folderArg) {
-        const notice = new Notice('PwnDoc Importer: reading the engagement…', 0);
+        const notice = new Notice('PwnDoc 2Sync: reading the engagement…', 0);
         try {
             const auditId = await this.currentAuditId(folderArg);
             if (!auditId) return;
@@ -3171,7 +3171,7 @@ class PwnDocImporterPlugin extends Plugin {
                   loadBase: id => loadBase(this.app.vault.adapter, historyDir(this.manifest.dir, id)) });
             const tpl = await this.api('GET', '/api/templates').then(t => templateLabel(audit, t || []), () => null);
             new DashboardModal(this.app, this, data, { title: `${audit.name} (${audit.state})${tpl ? ` · report template: ${tpl}` : ''}`, audit }).open();
-        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
         finally { notice.hide(); }
     }
 
@@ -3202,25 +3202,25 @@ class PwnDocImporterPlugin extends Plugin {
         const text = [`${direction === 'push' ? 'Pushed' : 'Pulled'} ${done.length} note(s).`,
             ...(skipped.length ? [`Skipped (not overwriting the other side):`, ...skipped] : []),
             ...(failed.length ? ['Failed:', ...failed] : [])].join('\n');
-        new Notice(`PwnDoc Importer: ${text}`, skipped.length || failed.length ? 15000 : 5000);
-        console.log('[PwnDoc Importer] bulk', direction, { done, skipped, failed });
+        new Notice(`PwnDoc 2Sync: ${text}`, skipped.length || failed.length ? 15000 : 5000);
+        console.log('[PwnDoc 2Sync] bulk', direction, { done, skipped, failed });
     }
 
     // Remove the finding link (the engagement attribute stays). Returns true when done.
     async unlinkNote(file) {
         if (file === undefined) file = this.app.workspace.getActiveFile(); // an explicit null means the note is gone
         const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
-        if (!fm?.pwndoc_finding_id) { new Notice('PwnDoc Importer: this note is not linked to a finding.'); return false; }
+        if (!fm?.pwndoc_finding_id) { new Notice('PwnDoc 2Sync: this note is not linked to a finding.'); return false; }
         if (!(await new Promise(r => new ConfirmModal(this.app, `Unlink "${file.basename}" from its PwnDoc finding? The note and the finding stay as they are; the sync history is kept.`, r).open()))) return false;
         await this.app.fileManager.processFrontMatter(file, f => { delete f.pwndoc_finding_id; });
         this.remoteWarn.delete(file.path);
-        new Notice('PwnDoc Importer: note unlinked.');
+        new Notice('PwnDoc 2Sync: note unlinked.');
         return true;
     }
 
     // Notes of the whole vault whose finding or engagement no longer exists on PwnDoc
     async findOrphans() {
-        const notice = new Notice('PwnDoc Importer: checking linked notes…', 0);
+        const notice = new Notice('PwnDoc 2Sync: checking linked notes…', 0);
         try {
             const byAudit = new Map();
             for (const f of this.app.vault.getMarkdownFiles()) {
@@ -3239,7 +3239,7 @@ class PwnDocImporterPlugin extends Plugin {
                 }
             }
             new DashboardModal(this.app, this, { rows: [], orphans, unlinked: [], missing: [] }, { title: 'Orphan notes', audit: null }).open();
-        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
         finally { notice.hide(); }
     }
 
@@ -3254,7 +3254,7 @@ class PwnDocImporterPlugin extends Plugin {
 
     async lintCurrentNote() {
         const file = this.app.workspace.getActiveFile();
-        if (!file) { new Notice('PwnDoc Importer: open a note first.'); return; }
+        if (!file) { new Notice('PwnDoc 2Sync: open a note first.'); return; }
         const md = await this.app.vault.read(file);
         const ctx = this.syncCtx(file, '', '');
         const body = Object.keys(parseSections(md)).filter(k => !defOf(k).source && k !== 'customFields');
@@ -3287,7 +3287,7 @@ class PwnDocImporterPlugin extends Plugin {
             const sig = keys.join(',');
             if (keys.length && this.remoteSeen.get(file.path) !== sig) {
                 this.remoteSeen.set(file.path, sig);
-                new Notice(`PwnDoc Importer: "${file.basename}" changed on PwnDoc (${keys.map(k => labelOf(defOf(k))).join(', ')}). Compare before you push.`, 8000);
+                new Notice(`PwnDoc 2Sync: "${file.basename}" changed on PwnDoc (${keys.map(k => labelOf(defOf(k))).join(', ')}). Compare before you push.`, 8000);
             }
             if (!keys.length) this.remoteSeen.delete(file.path);
         } catch (e) { this.remoteBackoff = Date.now() + 10 * 60000; this.dbg('remote check failed, pausing the background check for 10 minutes:', e.message); }
@@ -3299,7 +3299,7 @@ class PwnDocImporterPlugin extends Plugin {
         const file = this.app.workspace.getActiveFile();
         const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
         const link = file && resolveFindingLink(file.path, fm, this.settings.folderAudits);
-        if (!link) { new Notice('PwnDoc Importer: associate this note to a finding first.'); return; }
+        if (!link) { new Notice('PwnDoc 2Sync: associate this note to a finding first.'); return; }
         try {
             const ctx = this.syncCtx(file, link.findingId, link.auditId);
             const args = { ...link, completed, localBefore: await this.app.vault.read(file) };
@@ -3310,15 +3310,15 @@ class PwnDocImporterPlugin extends Plugin {
             }
             const upd = metaToFrontmatter({ status: completed ? 'completed' : 'in progress' }, fm);
             if (Object.keys(upd).length) await this.app.fileManager.processFrontMatter(file, f => Object.assign(f, upd));
-            new Notice(`PwnDoc Importer: finding ${completed ? 'marked as completed' : 'reopened'} on PwnDoc.`);
+            new Notice(`PwnDoc 2Sync: finding ${completed ? 'marked as completed' : 'reopened'} on PwnDoc.`);
             this.checkRemote(file);
-        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
     }
 
     // Pick the report template of an engagement and store it on the audit. Returns the template id, or null if cancelled.
     async chooseAuditTemplate(auditId) {
         const [audit, templates] = await Promise.all([this.api('GET', `/api/audits/${auditId}`), this.api('GET', '/api/templates')]);
-        if (!templates?.length) { new Notice('PwnDoc Importer: PwnDoc has no report templates.'); return null; }
+        if (!templates?.length) { new Notice('PwnDoc 2Sync: PwnDoc has no report templates.'); return null; }
         const templateId = await new Promise(r => new TemplatePickModal(this.app, templates, templateIdOf(audit), r).open());
         if (!templateId) return null;
         const ctx = { api: (m, p, o) => this.api(m, p, o) };
@@ -3330,8 +3330,8 @@ class PwnDocImporterPlugin extends Plugin {
         }
         const was = res.previous ? templates.find(t => t._id === res.previous)?.name || res.previous : 'none';
         new Notice(res.changed
-            ? `PwnDoc Importer: template of "${audit.name}" is now "${templates.find(t => t._id === templateId).name}" (was: ${was}).`
-            : `PwnDoc Importer: "${audit.name}" already uses that template.`);
+            ? `PwnDoc 2Sync: template of "${audit.name}" is now "${templates.find(t => t._id === templateId).name}" (was: ${was}).`
+            : `PwnDoc 2Sync: "${audit.name}" already uses that template.`);
         return templateId;
     }
 
@@ -3339,7 +3339,7 @@ class PwnDocImporterPlugin extends Plugin {
         try {
             const auditId = await this.currentAuditId();
             if (auditId) await this.chooseAuditTemplate(auditId);
-        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
     }
 
     // Why did the export fail? Check the General Information of the engagement and show what is missing
@@ -3367,7 +3367,7 @@ class PwnDocImporterPlugin extends Plugin {
             const missing = missingGeneralFields(audit, this.generalRequired(), this.cfDefs || []);
             new InfoModal(this.app, `General Information of "${audit.name}"`,
                 missing.length ? ['Missing:', ...missing.map(m => `- ${m.label}`)] : ['All the mandatory fields are filled in.']).open();
-        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
     }
 
     // Generate the report of an engagement from the template stored on it (asked for when there is none) and save it in the vault
@@ -3378,7 +3378,7 @@ class PwnDocImporterPlugin extends Plugin {
             const audit = await this.api('GET', `/api/audits/${auditId}`);
             if (!templateIdOf(audit) && !(await this.chooseAuditTemplate(auditId))) return;
 
-            const notice = new Notice('PwnDoc Importer: generating the report…', 0);
+            const notice = new Notice('PwnDoc 2Sync: generating the report…', 0);
             let r;
             try { r = await generateReport({ api: (m, p, o) => this.api(m, p, o) }, { auditId }); }
             catch (e) { notice.hide(); console.error(e); await this.explainReportFailure(auditId, e); return; }
@@ -3388,22 +3388,22 @@ class PwnDocImporterPlugin extends Plugin {
             if (folder && !(await adapter.exists(folder))) await adapter.mkdir(folder);
             const path = normalizePath(`${folder ? folder + '/' : ''}${reportFileName(audit.name, r.ext)}`);
             await adapter.writeBinary(path, r.buf.buffer.slice(r.buf.byteOffset, r.buf.byteOffset + r.buf.byteLength));
-            new Notice(`PwnDoc Importer: report saved to ${path} (template: ${r.templateName})`, 8000);
+            new Notice(`PwnDoc 2Sync: report saved to ${path} (template: ${r.templateName})`, 8000);
             this.app.openWithDefaultApp?.(path);
-        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
     }
 
     // Clipboard image into the attachments folder, linked at the cursor with its numbered caption
     async pasteImageWithCaption(editor, view) {
         let img;
         try { img = require('electron').clipboard.readImage(); }
-        catch { new Notice('PwnDoc Importer: the clipboard is not available here.'); return; }
-        if (img.isEmpty()) { new Notice('PwnDoc Importer: there is no image in the clipboard.'); return; }
+        catch { new Notice('PwnDoc 2Sync: the clipboard is not available here.'); return; }
+        if (img.isEmpty()) { new Notice('PwnDoc 2Sync: there is no image in the clipboard.'); return; }
         const file = view.file;
         const caption = await new Promise(r => new PromptModal(this.app, 'Figure caption', 'e.g. Login request intercepted in Burp', r).open());
         if (!caption) return;
         const png = img.toPNG();
-        if (png.length > MAX_IMAGE_BYTES) new Notice('PwnDoc Importer: the image is above 12 MB, PwnDoc will refuse it on push.');
+        if (png.length > MAX_IMAGE_BYTES) new Notice('PwnDoc 2Sync: the image is above 12 MB, PwnDoc will refuse it on push.');
         const adapter = this.app.vault.adapter;
         const folder = this.settings.attachmentsFolder;
         if (folder && !(await adapter.exists(folder))) await adapter.mkdir(folder);
@@ -3498,7 +3498,7 @@ class PwnDocImporterPlugin extends Plugin {
                 else                        bottomChunks.push(chunk);
             } catch (e) {
                 this.dbg(`template load failed (${tpl.path}): ${e.message}`);
-                new Notice(`PwnDoc Importer: could not read template "${tpl.path}"`);
+                new Notice(`PwnDoc 2Sync: could not read template "${tpl.path}"`);
             }
         }
 
@@ -3560,7 +3560,7 @@ class PwnDocImporterPlugin extends Plugin {
             new Notice(`Created: ${noteName}`);
             return file;
         } catch (e) {
-            new Notice(`PwnDoc Importer: failed to create note — ${e.message}`);
+            new Notice(`PwnDoc 2Sync: failed to create note — ${e.message}`);
             console.error(e);
         }
     }

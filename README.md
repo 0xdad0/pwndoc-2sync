@@ -1,6 +1,8 @@
-# PwnDoc Importer
+# PwnDoc 2Sync
 
-An [Obsidian](https://obsidian.md) plugin that imports vulnerabilities from a [PwnDoc](https://github.com/pwndoc/pwndoc) instance — either from a local CSV export or directly via the PwnDoc API — and automatically creates structured notes in your vault.
+An [Obsidian](https://obsidian.md) plugin that keeps your finding notes and a [PwnDoc](https://github.com/pwndoc/pwndoc) engagement in sync in both directions: write the finding in Obsidian, send it to the engagement (select or create the finding, compare, push with images), pull what changed on PwnDoc, and generate the report. It also imports library vulnerabilities, from a CSV export or directly via the API, into structured notes. See **Engagement sync** below.
+
+> Formerly *PwnDoc Importer*. The plugin id is still `pwndoc-importer`, so the folder, settings, history and stored password of an existing installation keep working.
 
 ## Features
 
@@ -31,11 +33,11 @@ An [Obsidian](https://obsidian.md) plugin that imports vulnerabilities from a [P
    <your-vault>/.obsidian/plugins/pwndoc-importer/
    ```
 2. Ensure the folder contains `manifest.json` and `main.js`.
-3. In Obsidian, go to **Settings → Community plugins**, disable Safe Mode, and enable **PwnDoc Importer**.
+3. In Obsidian, go to **Settings → Community plugins**, disable Safe Mode, and enable **PwnDoc 2Sync**.
 
 ## Configuration
 
-Open **Settings → PwnDoc Importer** to configure the plugin.
+Open **Settings → PwnDoc 2Sync** to configure the plugin.
 
 ### General
 
@@ -87,7 +89,7 @@ If any credential field is left blank, the plugin will prompt for credentials at
 
 | Setting | Default | Description |
 |---|---|---|
-| **Debug mode** | `off` | When enabled, logs detailed information to the browser console during API imports. Open the developer tools with `Ctrl+Shift+I` and filter by `[PwnDoc Importer]` in the Console tab. |
+| **Debug mode** | `off` | When enabled, logs detailed information to the browser console during API imports. Open the developer tools with `Ctrl+Shift+I` and filter by `[PwnDoc 2Sync]` in the Console tab. |
 
 ## Usage
 
