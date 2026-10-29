@@ -129,7 +129,7 @@ Link notes to a PwnDoc **engagement (audit)**, compare them with the matching **
    - You get the findings of the engagement, best title match first. Pick the one that is the same vulnerability, or choose **+ Create a new finding**: it is created from a library vulnerability (the one in `pwndoc_id` is suggested) or blank with the note title and CVSS.
    - The note is linked (`pwndoc_finding_id`) and the compare opens with **Evidenza only** preselected, the other sections untouched. Check the side-by-side, press **Apply**: lint runs, then the section is pushed. Images are uploaded.
 4. **Next times** the same command opens the compare directly (the note is already linked). Use the **dashboard** to see every note of the engagement at once and push or pull Evidenza in bulk.
-5. **Close up:** *Mark PwnDoc finding as completed*, then *Generate PwnDoc report*. Every write is recorded in the history and can be rolled back.
+5. **Close up:** *Mark PwnDoc finding as completed*, *Choose the report template of the engagement* (once), then *Generate PwnDoc report*. Every write is recorded in the history and can be rolled back.
 
 Nothing is written to PwnDoc before you press Apply (or confirm a status change); creating a finding is the only write that happens earlier, and it asks first. On an audit not in state `EDIT` every write needs **Enforce**.
 
@@ -210,9 +210,12 @@ When a linked note is opened (and every *Check interval* minutes for the open no
 - **Find orphan notes** checks every linked note of the vault against PwnDoc.
 - **Mark PwnDoc finding as completed** / **Reopen PwnDoc finding** change `status` on PwnDoc (state guard and history apply) and mirror it in the note frontmatter.
 
-### Report
+### Report template and report
 
-**Generate PwnDoc report (choose template)** lists the templates of the PwnDoc instance (the audit's current one first), generates the report of the engagement and saves it in the **Reports folder** (then opens it with the default application). PwnDoc renders with the template stored on the audit, so choosing a different one switches the template for the duration of the call and puts the original back afterwards, also if the generation fails. That switch is a write: it requires the audit in state `EDIT` or **Enforce**.
+The report template is a property of the **engagement** on PwnDoc, and the report is always rendered from it.
+
+- **Choose the report template of the engagement** lists the templates of the PwnDoc instance (the current one first and marked) and stores the pick on the audit. It is a write to the audit, so it requires state `EDIT` or **Enforce**; the notice tells which template it replaced, so changing it back is one more run of the command. Choosing the template already in use does nothing. The dashboard title shows the current template.
+- **Generate PwnDoc report** renders the engagement with its template and saves the file (`.docx`, or the extension of the template) in the **Reports folder**, then opens it with the default application. If the engagement has no template yet it first asks you to choose one.
 
 ### Images with figure captions
 

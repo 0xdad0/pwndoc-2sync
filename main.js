@@ -1105,28 +1105,34 @@ function bulkPlan(row, direction, keys) {
     return { run, blocked };
 }
 
-// ── Report generation ─────────────────────────────────────────────────────────
-// PwnDoc renders the audit with the template stored on the audit, so choosing another one means switching it for the
-// duration of the call and putting the original back afterwards, also when the generation fails.
-async function generateReport(ctx, { auditId, templateId, force }) {
+// ── Report template of the engagement and report generation ───────────────────
+const templateIdOf = audit => audit.template?._id ?? audit.template ?? null;
+
+function templateLabel(audit, templates) {
+    const id = templateIdOf(audit);
+    if (!id) return 'no template';
+    const t = templates.find(x => x._id === id);
+    return t ? `${t.name} (${t.ext})` : 'unknown template';
+}
+
+// The report template lives on the audit: choosing one is a write to the audit (state guard applies)
+async function setAuditTemplate(ctx, { auditId, templateId, force }) {
+    const audit = await ctx.api('GET', `/api/audits/${auditId}`);
+    const previous = templateIdOf(audit);
+    if (previous === templateId) return { changed: false, previous };
+    assertEditable(audit, force);
+    await ctx.api('PUT', `/api/audits/${auditId}/general`, { body: { template: templateId } });
+    return { changed: true, previous };
+}
+
+// PwnDoc renders the report with the template stored on the audit, so that is the one used here
+async function generateReport(ctx, { auditId }) {
     const audit = await ctx.api('GET', `/api/audits/${auditId}`);
     const templates = (await ctx.api('GET', '/api/templates')) || [];
-    const current = audit.template?._id ?? audit.template ?? null;
-    const chosen = templateId ?? current;
-    if (!chosen) throw new Error('no report template selected, and the audit has none');
-    const switched = chosen !== current;
-    if (switched) assertEditable(audit, force);
-    const put = template => ctx.api('PUT', `/api/audits/${auditId}/general`, { body: { template } });
-    let touched = false, buf, failure, warning;
-    try {
-        if (switched) { touched = true; await put(chosen); }
-        buf = await ctx.api('GET', `/api/audits/${auditId}/generate`, { rawResponse: true });
-    } catch (e) { failure = e; }
-    if (touched && current) {
-        try { await put(current); } catch (e) { warning = `could not restore the original template (${current}): ${e.message}`; }
-    } else if (touched) warning = 'the audit had no template, it keeps the one chosen for this report';
-    if (failure) { if (warning) failure.message += ` (${warning})`; throw failure; }
-    return { buf, ext: templates.find(t => t._id === chosen)?.ext || 'docx', auditName: audit.name, warning };
+    const id = templateIdOf(audit);
+    if (!id) throw new Error('the engagement has no report template: set one first');
+    const buf = await ctx.api('GET', `/api/audits/${auditId}/generate`, { rawResponse: true });
+    return { buf, ext: templates.find(t => t._id === id)?.ext || 'docx', auditName: audit.name, templateName: templateLabel(audit, templates) };
 }
 
 const reportFileName = (auditName, ext, date = new Date()) => `${sanitizeTitle(auditName)} - ${date.toISOString().slice(0, 10)}.${ext}`;
@@ -2458,7 +2464,8 @@ class PwnDocImporterPlugin extends Plugin {
         cmd('find-orphans', 'Find orphan notes (finding or engagement gone from PwnDoc)', () => this.findOrphans());
         cmd('finding-completed', 'Mark PwnDoc finding as completed', () => this.setCompleted(true));
         cmd('finding-reopen', 'Reopen PwnDoc finding (in progress)', () => this.setCompleted(false));
-        cmd('generate-report', 'Generate PwnDoc report (choose template)', () => this.generateReportCommand());
+        cmd('set-report-template', 'Choose the report template of the engagement', () => this.setTemplateCommand());
+        cmd('generate-report', 'Generate PwnDoc report (docx from the engagement template)', () => this.generateReportCommand());
         this.addCommand({
             id: 'paste-image-with-caption',
             name: 'Paste clipboard image with numbered caption',
@@ -2793,6 +2800,7 @@ class PwnDocImporterPlugin extends Plugin {
         menu.addSeparator();
         item('Engagement dashboard', 'layout-dashboard', () => this.openDashboard());
         item('Find orphan notes', 'search-x', () => this.findOrphans());
+        item('Choose report template', 'file-cog', () => this.setTemplateCommand());
         item('Generate report', 'file-output', () => this.generateReportCommand());
         menu.addSeparator();
         item('Associate folder to engagement', 'folder-plus', () => this.associateFolder());
@@ -3112,7 +3120,8 @@ class PwnDocImporterPlugin extends Plugin {
                 (n, findingId) => this.syncCtx(this.app.vault.getAbstractFileByPath(n.path), findingId, auditId),
                 { audit, notes: await this.notesOfAudit(auditId), linkedIds: this.linkedFindingIds(),
                   loadBase: id => loadBase(this.app.vault.adapter, historyDir(this.manifest.dir, id)) });
-            new DashboardModal(this.app, this, data, { title: `${audit.name} (${audit.state})`, audit }).open();
+            const tpl = await this.api('GET', '/api/templates').then(t => templateLabel(audit, t || []), () => null);
+            new DashboardModal(this.app, this, data, { title: `${audit.name} (${audit.state})${tpl ? ` · report template: ${tpl}` : ''}`, audit }).open();
         } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
         finally { notice.hide(); }
     }
@@ -3257,30 +3266,51 @@ class PwnDocImporterPlugin extends Plugin {
         } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
     }
 
-    // Generate the report of an engagement with a template of the user's choice and save it in the vault
+    // Pick the report template of an engagement and store it on the audit. Returns the template id, or null if cancelled.
+    async chooseAuditTemplate(auditId) {
+        const [audit, templates] = await Promise.all([this.api('GET', `/api/audits/${auditId}`), this.api('GET', '/api/templates')]);
+        if (!templates?.length) { new Notice('PwnDoc Importer: PwnDoc has no report templates.'); return null; }
+        const templateId = await new Promise(r => new TemplatePickModal(this.app, templates, templateIdOf(audit), r).open());
+        if (!templateId) return null;
+        const ctx = { api: (m, p, o) => this.api(m, p, o) };
+        let res;
+        try { res = await setAuditTemplate(ctx, { auditId, templateId, force: false }); }
+        catch (e) {
+            if (!(e instanceof AuditLockedError) || !(await new Promise(r => new ConfirmModal(this.app, `${e.message}. Enforce this change of template?`, r).open()))) throw e;
+            res = await setAuditTemplate(ctx, { auditId, templateId, force: true });
+        }
+        const was = res.previous ? templates.find(t => t._id === res.previous)?.name || res.previous : 'none';
+        new Notice(res.changed
+            ? `PwnDoc Importer: template of "${audit.name}" is now "${templates.find(t => t._id === templateId).name}" (was: ${was}).`
+            : `PwnDoc Importer: "${audit.name}" already uses that template.`);
+        return templateId;
+    }
+
+    async setTemplateCommand() {
+        try {
+            const auditId = await this.currentAuditId();
+            if (auditId) await this.chooseAuditTemplate(auditId);
+        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+    }
+
+    // Generate the report of an engagement from the template stored on it (asked for when there is none) and save it in the vault
     async generateReportCommand() {
         try {
             const auditId = await this.currentAuditId();
             if (!auditId) return;
-            const [audit, templates] = await Promise.all([this.api('GET', `/api/audits/${auditId}`), this.api('GET', '/api/templates')]);
-            if (!templates?.length) { new Notice('PwnDoc Importer: PwnDoc has no report templates.'); return; }
-            const current = audit.template?._id ?? audit.template ?? null;
-            const templateId = await new Promise(r => new TemplatePickModal(this.app, templates, current, r).open());
-            if (!templateId) return;
-            const force = templateId !== current && audit.state !== 'EDIT'
-                && await new Promise(r => new ConfirmModal(this.app, `Changing the template of an audit in state ${audit.state} is a write. Enforce? The original template is put back right after.`, r).open());
-            if (templateId !== current && audit.state !== 'EDIT' && !force) return;
+            const audit = await this.api('GET', `/api/audits/${auditId}`);
+            if (!templateIdOf(audit) && !(await this.chooseAuditTemplate(auditId))) return;
 
             const notice = new Notice('PwnDoc Importer: generating the report…', 0);
             let r;
-            try { r = await generateReport({ api: (m, p, o) => this.api(m, p, o) }, { auditId, templateId, force }); }
+            try { r = await generateReport({ api: (m, p, o) => this.api(m, p, o) }, { auditId }); }
             finally { notice.hide(); }
             const adapter = this.app.vault.adapter;
             const folder = this.settings.reportsFolder;
             if (folder && !(await adapter.exists(folder))) await adapter.mkdir(folder);
             const path = normalizePath(`${folder ? folder + '/' : ''}${reportFileName(audit.name, r.ext)}`);
             await adapter.writeBinary(path, r.buf.buffer.slice(r.buf.byteOffset, r.buf.byteOffset + r.buf.byteLength));
-            new Notice(`PwnDoc Importer: report saved to ${path}${r.warning ? `. Warning: ${r.warning}` : ''}`, r.warning ? 15000 : 5000);
+            new Notice(`PwnDoc Importer: report saved to ${path} (template: ${r.templateName})`, 8000);
             this.app.openWithDefaultApp?.(path);
         } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
     }
@@ -3459,7 +3489,7 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
+module.exports.__test = { setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
     sideBySide, missingFindings, findingToNoteRow, IMPORT_SECTIONS, folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,

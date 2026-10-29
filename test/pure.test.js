@@ -1065,42 +1065,6 @@ test('buildDashboard sorts notes into synced, orphan and unlinked, and lists fin
     assert.deepEqual(d.missing.map(f => f._id), ['f2']);
 });
 
-test('generateReport uses the audit template, or switches to another one and puts the original back', async () => {
-    const calls = [];
-    const api = tpl => async (method, path, opts) => {
-        calls.push([method, path, opts?.body]);
-        if (path === '/api/audits/A1') return { _id: 'A1', name: 'Acme: web', state: 'EDIT', template: { _id: 't1' } };
-        if (path === '/api/templates') return [{ _id: 't1', name: 'Std', ext: 'docx' }, { _id: 't2', name: 'Short', ext: 'odt' }];
-        if (path === '/api/audits/A1/generate') return Buffer.from('DOC');
-        return 'ok';
-    };
-    let r = await T.generateReport({ api: api() }, { auditId: 'A1' });
-    assert.equal(r.buf.toString(), 'DOC');
-    assert.equal(r.ext, 'docx');
-    assert.equal(calls.filter(c => c[0] === 'PUT').length, 0);
-
-    calls.length = 0;
-    r = await T.generateReport({ api: api() }, { auditId: 'A1', templateId: 't2' });
-    assert.equal(r.ext, 'odt');
-    assert.deepEqual(calls.filter(c => c[0] === 'PUT').map(c => c[2]), [{ template: 't2' }, { template: 't1' }]);
-    assert.deepEqual(calls.map(c => c[1]).filter(p => p.endsWith('generate')), ['/api/audits/A1/generate']);
-});
-
-test('generateReport restores the template even when generation fails, and refuses to switch on a locked audit', async () => {
-    const puts = [];
-    const api = async (method, path, opts) => {
-        if (path === '/api/audits/A1') return { state: 'EDIT', template: 't1' };
-        if (path === '/api/templates') return [{ _id: 't1', ext: 'docx' }, { _id: 't2', ext: 'docx' }];
-        if (method === 'PUT') { puts.push(opts.body.template); return 'ok'; }
-        throw new Error('HTTP 500: boom');
-    };
-    await assert.rejects(T.generateReport({ api }, { auditId: 'A1', templateId: 't2' }), /HTTP 500/);
-    assert.deepEqual(puts, ['t2', 't1']);
-    const locked = async (m, p) => (p === '/api/audits/A1' ? { state: 'APPROVED', template: 't1' } : p === '/api/templates' ? [] : 'x');
-    await assert.rejects(T.generateReport({ api: locked }, { auditId: 'A1', templateId: 't2' }), /not EDIT/);
-    await assert.rejects(T.generateReport({ api: async (m, p) => (p === '/api/templates' ? [] : { state: 'EDIT' }) }, { auditId: 'A1' }), /no report template/);
-});
-
 test('reportFileName strips what a path cannot hold; pastedImageName is unique per note and time', () => {
     assert.equal(T.reportFileName('Acme: web/app', 'docx', new Date('2026-10-29T10:00:00Z')), 'Acme- web-app - 2026-10-29.docx');
     assert.equal(T.pastedImageName('VT-01 - XSS', new Date('2026-10-29T10:11:12Z')), 'VT-01 - XSS 20261029101112.png');
@@ -1178,34 +1142,6 @@ test('pastedImageName leaves no parenthesis or hash that would end the markdown 
     assert.equal(T.pastedImageName('VT-03 - XSS (Reflected) #1', new Date('2026-10-29T10:11:12Z')), 'VT-03 - XSS -Reflected- -1 20261029101112.png');
 });
 
-test('generateReport reports a failed restore without losing the report, and says when there was nothing to restore', async () => {
-    let fail = false;
-    const api = cur => async (method, path, opts) => {
-        if (path === '/api/audits/A1') return { state: 'EDIT', template: cur };
-        if (path === '/api/templates') return [{ _id: 't1', ext: 'docx' }, { _id: 't2', ext: 'docx' }];
-        if (method === 'PUT') { if (fail && opts.body.template === 't1') throw new Error('HTTP 500'); return 'ok'; }
-        return Buffer.from('DOC');
-    };
-    fail = true;
-    let r = await T.generateReport({ api: api('t1') }, { auditId: 'A1', templateId: 't2' });
-    assert.equal(r.buf.toString(), 'DOC');
-    assert.match(r.warning, /could not restore/);
-    fail = false;
-    r = await T.generateReport({ api: api(null) }, { auditId: 'A1', templateId: 't2' });
-    assert.match(r.warning, /had no template/);
-});
-
-test('generateReport restores the template when the switch itself fails half way', async () => {
-    const puts = [];
-    const api = async (method, path, opts) => {
-        if (path === '/api/audits/A1') return { state: 'EDIT', template: 't1' };
-        if (path === '/api/templates') return [];
-        if (method === 'PUT') { puts.push(opts.body.template); if (opts.body.template === 't2') throw new Error('timeout'); return 'ok'; }
-    };
-    await assert.rejects(T.generateReport({ api }, { auditId: 'A1', templateId: 't2' }), /timeout/);
-    assert.deepEqual(puts, ['t2', 't1']);
-});
-
 test('lint ignores images and captions inside code fences', () => {
     const md = '## Evidenza\n\n```\n![x](https://evil/x.png)\n*Figura 9 – dentro*\n```\n\n![](a.png)\n*Figura 1 – fuori*\n';
     assert.deepEqual(lintNote(md), []);
@@ -1216,4 +1152,42 @@ test('findingChoices ranks the audit findings by title and offers creation: firs
     assert.deepEqual(T.findingChoices('XSS', fs).map(c => c.create ? 'create' : c.finding._id), ['b', 'a', 'create']);
     assert.deepEqual(T.findingChoices('Open redirect', fs).map(c => c.create ? 'create' : c.finding._id), ['create', 'b', 'a']);
     assert.deepEqual(T.findingChoices('Open redirect', []).map(c => !!c.create), [true]);
+});
+
+test('generateReport renders with the template stored on the audit and never touches it', async () => {
+    const calls = [];
+    const api = async (method, path, opts) => {
+        calls.push(method + ' ' + path);
+        if (path === '/api/audits/A1') return { name: 'Acme', template: { _id: 't2' } };
+        if (path === '/api/templates') return [{ _id: 't1', name: 'Std', ext: 'docx' }, { _id: 't2', name: 'Short', ext: 'odt' }];
+        return Buffer.from('DOC');
+    };
+    const r = await T.generateReport({ api }, { auditId: 'A1' });
+    assert.deepEqual([r.buf.toString(), r.ext, r.templateName], ['DOC', 'odt', 'Short (odt)']);
+    assert.ok(!calls.some(c => c.startsWith('PUT')));
+    await assert.rejects(T.generateReport({ api: async (m, p) => (p === '/api/templates' ? [] : { name: 'x' }) }, { auditId: 'A1' }), /no report template/);
+});
+
+test('setAuditTemplate changes the template of the engagement (state guard, no-op when unchanged)', async () => {
+    const puts = [];
+    const api = state => async (method, path, opts) => {
+        if (method === 'PUT') { puts.push([path, opts.body]); return 'ok'; }
+        return { state, template: 't1' };
+    };
+    assert.deepEqual(await T.setAuditTemplate({ api: api('EDIT') }, { auditId: 'A1', templateId: 't1' }), { changed: false, previous: 't1' });
+    assert.equal(puts.length, 0);
+    assert.deepEqual(await T.setAuditTemplate({ api: api('EDIT') }, { auditId: 'A1', templateId: 't2' }), { changed: true, previous: 't1' });
+    assert.deepEqual(puts, [['/api/audits/A1/general', { template: 't2' }]]);
+    await assert.rejects(T.setAuditTemplate({ api: api('APPROVED') }, { auditId: 'A1', templateId: 't2' }), /not EDIT/);
+    assert.equal(puts.length, 1);
+    await T.setAuditTemplate({ api: api('APPROVED') }, { auditId: 'A1', templateId: 't2', force: true });
+    assert.equal(puts.length, 2);
+});
+
+test('templateLabel names the template of an audit, or says there is none', () => {
+    const ts = [{ _id: 't1', name: 'Std', ext: 'docx' }];
+    assert.equal(T.templateLabel({ template: { _id: 't1' } }, ts), 'Std (docx)');
+    assert.equal(T.templateLabel({ template: 't1' }, ts), 'Std (docx)');
+    assert.equal(T.templateLabel({ template: 'zz' }, ts), 'unknown template');
+    assert.equal(T.templateLabel({}, ts), 'no template');
 });
