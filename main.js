@@ -196,6 +196,48 @@ const htmlToMd = html => (html ? htmlToMarkdown(html).trim() : '');
 // Comparison form: both sides pass through the same renderer so formatting noise cancels out
 async function normalizeMd(app, md) { return htmlToMd(await mdToHtml(app, md)); }
 
+// ── Engagement association ────────────────────────────────────────────────────
+const parentDir = p => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
+
+// Note frontmatter wins; otherwise the nearest associated ancestor folder
+function resolveAuditId(notePath, fm, folderAudits) {
+    if (fm?.pwndoc_audit_id) return fm.pwndoc_audit_id;
+    for (let dir = parentDir(notePath); ; dir = parentDir(dir)) {
+        if (folderAudits[dir]) return folderAudits[dir].auditId;
+        if (!dir) return null;
+    }
+}
+
+function renameFolderKeys(folderAudits, oldPath, newPath) {
+    const out = {};
+    for (const [k, v] of Object.entries(folderAudits)) {
+        if (k === oldPath) out[newPath] = v;
+        else if (k.startsWith(oldPath + '/')) out[newPath + k.slice(oldPath.length)] = v;
+        else out[k] = v;
+    }
+    return out;
+}
+
+// Title as PwnDoc knows it: the note name without the "VT-NN - " / "M-NN - " prefix
+const titleFromBasename = basename => basename.replace(/^(VT|M)-\d+ - /, '');
+
+const normTitle = t => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+// Findings ordered so the best title match comes first
+function rankFindings(title, findings) {
+    const t = normTitle(title);
+    const score = f => {
+        const ft = normTitle(f.title);
+        return ft === t ? 0 : (ft.includes(t) || t.includes(ft)) ? 1 : 2;
+    };
+    return [...findings].sort((a, b) => score(a) - score(b) || Number(a.identifier) - Number(b.identifier));
+}
+
+const pwndocListAudits = async (baseUrl, token, ignoreSsl) =>
+    (await pwndocApi(baseUrl, token, 'GET', '/api/audits', { ignoreSsl })) || [];
+const pwndocGetAudit = (baseUrl, token, id, ignoreSsl) =>
+    pwndocApi(baseUrl, token, 'GET', `/api/audits/${id}`, { ignoreSsl });
+
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
 async function readFilePath(app, filePath) {
     if (/^([A-Za-z]:[\\/]|\/)/.test(filePath)) {
@@ -365,6 +407,7 @@ const DEFAULT_SETTINGS = {
     csvOutputFolder: '',
     debugMode:       false,
     templates:       [], // [{ label: string, path: string, position: 'top'|'bottom' }]
+    folderAudits:    {}, // { [vault folder path]: { auditId, name } }
 };
 
 // ── Modal: fuzzy search over vuln list ────────────────────────────────────────
@@ -851,6 +894,45 @@ class PwnDocSettingTab extends PluginSettingTab {
     }
 }
 
+// ── Modal: choose a PwnDoc audit (engagement) ─────────────────────────────────
+class AuditPickModal extends FuzzySuggestModal {
+    constructor(app, audits, onChoose) {
+        super(app);
+        this.audits = [...audits].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+        this.onChoose = onChoose;
+        this.setPlaceholder('Search engagement (audit)...');
+    }
+    getItems() { return this.audits; }
+    getItemText(a) { return `${a.name || ''} ${a.company?.name || ''}`; }
+    renderSuggestion(item, el) {
+        const a = item.item;
+        el.createEl('div', { text: a.name || a._id });
+        el.createEl('small', {
+            text: [a.company?.name, a.language, a.state, (a.createdAt || '').slice(0, 10)].filter(Boolean).join(' · '),
+            cls: 'pwndoc-meta',
+        });
+    }
+    onChooseItem(a) { this.onChoose(a); }
+}
+
+// ── Modal: choose a finding of the audit (best title match first) ─────────────
+class FindingPickModal extends FuzzySuggestModal {
+    constructor(app, findings, suggestedTitle, onChoose) {
+        super(app);
+        this.findings = rankFindings(suggestedTitle, findings);
+        this.onChoose = onChoose;
+        this.setPlaceholder('Search finding in the audit...');
+    }
+    getItems() { return this.findings; }
+    getItemText(f) { return `${f.identifier || ''} ${f.title || ''}`; }
+    renderSuggestion(item, el) {
+        const f = item.item;
+        el.createEl('div', { text: f.title || f._id });
+        el.createEl('small', { text: [`#${f.identifier}`, f.vulnType, f.cvssv3].filter(Boolean).join(' · '), cls: 'pwndoc-meta' });
+    }
+    onChooseItem(f) { this.onChoose(f); }
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 class PwnDocImporterPlugin extends Plugin {
     async onload() {
@@ -878,6 +960,23 @@ class PwnDocImporterPlugin extends Plugin {
             name: 'Quick import vulnerability (use default source and language)',
             callback: () => this.quickImport(),
         });
+        this.addCommand({
+            id: 'associate-folder-to-audit',
+            name: 'Associate folder to PwnDoc engagement',
+            callback: () => this.associateFolder(),
+        });
+        this.addCommand({
+            id: 'associate-note-to-finding',
+            name: 'Associate note to PwnDoc finding',
+            callback: () => this.associateNote(),
+        });
+        this.registerEvent(this.app.vault.on('rename', async (file, oldPath) => {
+            if (file.children === undefined) return; // folders only
+            const next = renameFolderKeys(this.settings.folderAudits, oldPath, file.path);
+            if (JSON.stringify(next) === JSON.stringify(this.settings.folderAudits)) return;
+            this.settings.folderAudits = next;
+            await this.saveSettings();
+        }));
     }
 
     async loadSettings() {
@@ -1031,6 +1130,77 @@ class PwnDocImporterPlugin extends Plugin {
         }).open();
     }
 
+    // ── Engagement sync: session and association ─────────────────────────────────
+
+    // Logged-in session {url, token, ignoreSsl}; credentials from settings/secretStorage, popup if incomplete
+    async session(force = false) {
+        if (this._session && !force) return this._session;
+        const s = this.settings;
+        const password = getApiPassword(this.app, s);
+        const creds = (s.apiUrl && s.apiUsername && password)
+            ? { url: s.apiUrl, username: s.apiUsername, password, ignoreSsl: s.apiIgnoreSsl }
+            : await new Promise(resolve => new ApiCredentialsModal(this.app, s, resolve).open());
+        const token = await pwndocLogin(creds.url, creds.username, creds.password, creds.ignoreSsl);
+        this._session = { url: creds.url, token, ignoreSsl: creds.ignoreSsl };
+        return this._session;
+    }
+
+    // Authenticated call; one re-login when the token is rejected
+    async api(method, path, opts = {}) {
+        let sess = await this.session();
+        try { return await pwndocApi(sess.url, sess.token, method, path, { ignoreSsl: sess.ignoreSsl, ...opts }); }
+        catch (e) {
+            if (!/HTTP 401/.test(e.message)) throw e;
+            sess = await this.session(true);
+            return pwndocApi(sess.url, sess.token, method, path, { ignoreSsl: sess.ignoreSsl, ...opts });
+        }
+    }
+
+    pickAudit() {
+        return new Promise(async resolve => {
+            let audits;
+            try { audits = (await this.api('GET', '/api/audits')) || []; }
+            catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); return resolve(null); }
+            new AuditPickModal(this.app, audits, resolve).open();
+        });
+    }
+
+    async associateFolder() {
+        const active = this.app.workspace.getActiveFile();
+        new FolderModal(this.app, active?.parent?.path === '/' ? '' : (active?.parent?.path ?? ''), async folder => {
+            const audit = await this.pickAudit();
+            if (!audit) return;
+            this.settings.folderAudits[folder] = { auditId: audit._id, name: audit.name };
+            await this.saveSettings();
+            new Notice(`PwnDoc Importer: "${folder || '/'}" → ${audit.name}`);
+        }).open();
+    }
+
+    // Resolve the audit for a note: its frontmatter, then the nearest associated folder, else ask
+    async auditIdFor(file) {
+        const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+        return resolveAuditId(file.path, fm, this.settings.folderAudits)
+            ?? (await this.pickAudit())?._id ?? null;
+    }
+
+    async associateNote() {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) { new Notice('PwnDoc Importer: open a note first.'); return; }
+        const auditId = await this.auditIdFor(file);
+        if (!auditId) return;
+        let audit;
+        try { audit = await this.api('GET', `/api/audits/${auditId}`); }
+        catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); return; }
+        if (!audit.findings?.length) { new Notice('PwnDoc Importer: this audit has no findings yet.'); return; }
+        new FindingPickModal(this.app, audit.findings, titleFromBasename(file.basename), async finding => {
+            await this.app.fileManager.processFrontMatter(file, fm => {
+                fm.pwndoc_audit_id = auditId;
+                fm.pwndoc_finding_id = finding._id;
+            });
+            new Notice(`PwnDoc Importer: linked to "${finding.title}"`);
+        }).open();
+    }
+
     // Step 2 — ask VT or M
     askPrefix(vuln) {
         new PrefixModal(this.app, prefix => this.askFolder(vuln, prefix)).open();
@@ -1095,6 +1265,7 @@ class PwnDocImporterPlugin extends Plugin {
         const title    = (vuln.title || 'Untitled').replace(/[\\/:*?"<>|]/g, '-');
         const noteName = `${prefix}-${num} - ${title}`;
         const filePath = folder ? `${folder}/${noteName}.md` : `${noteName}.md`;
+        const auditId = resolveAuditId(filePath, {}, this.settings.folderAudits);
 
         // Custom fields section at the end
         const cfSection = extraCf.length > 0
@@ -1131,6 +1302,7 @@ class PwnDocImporterPlugin extends Plugin {
             `locale: "${vuln.locale}"`,
             `category: "${vuln.category}"`,
             `assets: "INSERT_ASSET"`,
+            ...(auditId ? [`pwndoc_audit_id: "${auditId}"`] : []),
             '---',
         ].join('\n');
 
@@ -1178,4 +1350,4 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens };
+module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings };

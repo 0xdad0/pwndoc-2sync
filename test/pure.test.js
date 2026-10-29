@@ -136,3 +136,34 @@ test('image tokens round-trip id and alt, even with markdown-special characters'
     assert.match(tok, /^[^*_\s]+$/);
     assert.equal(T.expandImgTokens(`<p>${tok}</p>`), '<p><img src="6ae342352f6b9b3e849af420" alt="Figura 1 – *x* _y_"></p>');
 });
+
+// ── association ───────────────────────────────────────────────────────────────
+test('resolveAuditId: note wins over folder, nearest ancestor wins, none gives null', () => {
+    const fa = { 'Clients/A': { auditId: 'A1' }, 'Clients/A/web': { auditId: 'A2' } };
+    assert.equal(T.resolveAuditId('Clients/A/web/VT-01 - x.md', {}, fa), 'A2');
+    assert.equal(T.resolveAuditId('Clients/A/mobile/M-01 - x.md', {}, fa), 'A1');
+    assert.equal(T.resolveAuditId('Clients/A/web/VT-01 - x.md', { pwndoc_audit_id: 'N' }, fa), 'N');
+    assert.equal(T.resolveAuditId('Other/VT-01 - x.md', {}, fa), null);
+    assert.equal(T.resolveAuditId('Clients/AB/VT-01 - x.md', {}, fa), null);
+});
+
+test('renameFolderKeys rewrites the folder and its descendants only', () => {
+    const fa = { 'Clients/A': { auditId: 'A1' }, 'Clients/A/web': { auditId: 'A2' }, 'Clients/AB': { auditId: 'B' } };
+    assert.deepEqual(T.renameFolderKeys(fa, 'Clients/A', 'Clients/Z'),
+        { 'Clients/Z': { auditId: 'A1' }, 'Clients/Z/web': { auditId: 'A2' }, 'Clients/AB': { auditId: 'B' } });
+});
+
+test('rankFindings puts the exact title first, then partial matches, then the rest by identifier', () => {
+    const fs_ = [
+        { _id: 'c', identifier: '3', title: 'Other' },
+        { _id: 'b', identifier: '2', title: 'SQL Injection in login' },
+        { _id: 'a', identifier: '1', title: 'sql  injection' },
+    ];
+    assert.deepEqual(T.rankFindings('SQL Injection', fs_).map(f => f._id), ['a', 'b', 'c']);
+});
+
+test('titleFromBasename strips the VT/M prefix only', () => {
+    assert.equal(T.titleFromBasename('VT-03 - SQL Injection'), 'SQL Injection');
+    assert.equal(T.titleFromBasename('M-12 - A - B'), 'A - B');
+    assert.equal(T.titleFromBasename('Plain title'), 'Plain title');
+});
