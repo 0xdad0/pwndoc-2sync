@@ -167,3 +167,88 @@ test('titleFromBasename strips the VT/M prefix only', () => {
     assert.equal(T.titleFromBasename('M-12 - A - B'), 'A - B');
     assert.equal(T.titleFromBasename('Plain title'), 'Plain title');
 });
+
+// ── images ────────────────────────────────────────────────────────────────────
+const IMD = [
+    'a ![Figura 1 – login](img/a b.png) b ![[shot.png|caption]] c ![[big.png|300]] d ![](x%20y.png)',
+    '```', '![in fence](nope.png)', '```', '![w|200](sized.png)', '![r](https://x.io/a.png)',
+].join('\n');
+
+test('extractImageRefs finds markdown and wikilink images, decodes src, drops sizes, skips fences', () => {
+    const refs = T.extractImageRefs(IMD).map(({ src, alt, remote }) => ({ src, alt, remote: !!remote }));
+    assert.deepEqual(refs, [
+        { src: 'img/a b.png', alt: 'Figura 1 – login', remote: false },
+        { src: 'shot.png', alt: 'caption', remote: false },
+        { src: 'big.png', alt: '', remote: false },
+        { src: 'x y.png', alt: '', remote: false },
+        { src: 'sized.png', alt: 'w', remote: false },
+        { src: 'https://x.io/a.png', alt: 'r', remote: true },
+    ]);
+});
+
+test('replaceImageRefs rewrites every ref outside fences and leaves fenced text alone', () => {
+    const out = T.replaceImageRefs(IMD, r => `<${r.src}>`);
+    assert.match(out, /^a <img\/a b\.png> b <shot\.png> c <big\.png> d <x y\.png>/);
+    assert.match(out, /!\[in fence\]\(nope\.png\)/);
+});
+
+function imgCtx(files = {}) {
+    const posts = [];
+    const cache = {};
+    return {
+        posts, cache, files,
+        resolvePath: src => (src in files ? src : null),
+        readBinary: async p => files[p],
+        api: async (method, path, opts) => {
+            if (method === 'POST') { posts.push(opts.body.name); return { _id: 'a'.repeat(23) + posts.length }; }
+            throw new Error('unexpected ' + method + ' ' + path);
+        },
+        save: async () => {},
+        imageCache: cache,
+    };
+}
+
+test('uploadImage uploads once per content hash and reuses the cached id', async () => {
+    const bytes = Buffer.from('PNGDATA');
+    const ctx = imgCtx({ 'a.png': bytes, 'b.png': bytes });
+    const id1 = await T.uploadImage(ctx, 'AUD', 'a.png');
+    const id2 = await T.uploadImage(ctx, 'AUD', 'b.png');
+    assert.equal(id1, id2);
+    assert.equal(ctx.posts.length, 1);
+});
+
+test('uploadImage rejects a missing file and an oversized file before any POST', async () => {
+    const ctx = imgCtx({ 'big.png': Buffer.alloc(13 * 1024 * 1024) });
+    await assert.rejects(T.uploadImage(ctx, 'AUD', 'nope.png'), /missing image: nope\.png/);
+    await assert.rejects(T.uploadImage(ctx, 'AUD', 'big.png'), /too large/);
+    assert.equal(ctx.posts.length, 0);
+});
+
+test('uploadImage rejects unsupported extensions and remote URLs', async () => {
+    const ctx = imgCtx({ 'x.exe': Buffer.from('x') });
+    await assert.rejects(T.uploadImage(ctx, 'AUD', 'x.exe'), /unsupported image type/);
+    await assert.rejects(T.uploadImage(ctx, 'AUD', 'https://x.io/a.png'), /remote image/);
+});
+
+test('tokenizeImages uploads every ref and swaps it for a token; a failing ref aborts with nothing replaced', async () => {
+    const ctx = imgCtx({ 'a.png': Buffer.from('A'), 'b.png': Buffer.from('B') });
+    const out = await T.tokenizeImages(ctx, 'AUD', 'x ![One](a.png) y ![[b.png|Two]]');
+    assert.equal((out.match(/⟦pwimg:/g) || []).length, 2);
+    assert.equal(T.expandImgTokens(out).includes('alt="Two"'), true);
+    await assert.rejects(T.tokenizeImages(imgCtx({ 'a.png': Buffer.from('A') }), 'AUD', '![](a.png) ![](gone.png)'), /missing image: gone\.png/);
+});
+
+test('pullImages downloads PwnDoc image ids into the folder and rewrites them to vault paths', async () => {
+    const ID = '6ae342352f6b9b3e849af420';
+    const written = {};
+    const ctx = {
+        api: async (m, p) => ({ _id: ID, name: 'spike.png', value: 'data:image/png;base64,' + Buffer.from('PNG').toString('base64') }),
+        exists: async p => p in written,
+        writeBinary: async (p, buf) => { written[p] = buf; },
+    };
+    const out = await T.pullImages(ctx, `text ![Fig 1](${ID}) and ![ext](https://x.io/a.png)`, 'attachments');
+    assert.equal(out, `text ![Fig 1](attachments/${ID}.png) and ![ext](https://x.io/a.png)`);
+    assert.equal(written[`attachments/${ID}.png`].toString(), 'PNG');
+    await T.pullImages(ctx, `![Fig 1](${ID})`, 'attachments'); // second pull: already there
+    assert.equal(Object.keys(written).length, 1);
+});

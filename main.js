@@ -238,6 +238,98 @@ const pwndocListAudits = async (baseUrl, token, ignoreSsl) =>
 const pwndocGetAudit = (baseUrl, token, id, ignoreSsl) =>
     pwndocApi(baseUrl, token, 'GET', `/api/audits/${id}`, { ignoreSsl });
 
+// ── Images ────────────────────────────────────────────────────────────────────
+const IMAGE_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+const MIME_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
+const MAX_IMAGE_BYTES = 12 * 1024 * 1024; // PwnDoc rejects bodies above ~17.8 MB, base64 adds a third
+const IMAGE_RE = /!\[\[([^\]|\n]+)(?:\|([^\]\n]*))?\]\]|!\[([^\]]*)\]\(([^)\n]*)\)/g;
+const SIZE_SUFFIX_RE = /^\d+(x\d+)?$/;
+
+// Apply fn to the text outside ``` / ~~~ code fences
+// ponytail: inline `code` spans are not excluded, an image ref inside one gets rewritten too
+function mapOutsideFences(md, fn) {
+    const out = [];
+    let chunk = [];
+    let fence = null;
+    const flush = () => { if (chunk.length) { out.push(fn(chunk.join('\n'))); chunk = []; } };
+    for (const line of md.split('\n')) {
+        const f = line.match(/^\s*(```+|~~~+)/);
+        if (f && !fence) { flush(); fence = f[1][0]; out.push(line); }
+        else if (f && f[1][0] === fence) { fence = null; out.push(line); }
+        else if (fence) out.push(line);
+        else chunk.push(line);
+    }
+    flush();
+    return out.join('\n');
+}
+
+function parseImageMatch(m) {
+    const wiki = m[1] !== undefined;
+    let src = (wiki ? m[1] : m[4]).trim().replace(/^<(.*)>$/, '$1');
+    try { src = decodeURIComponent(src); } catch { /* keep as written */ }
+    let alt = (wiki ? (m[2] || '') : m[3]).replace(/\|\d+(x\d+)?$/, '');
+    if (SIZE_SUFFIX_RE.test(alt)) alt = '';
+    return { raw: m[0], src, alt, remote: /^https?:\/\//i.test(src) };
+}
+
+function extractImageRefs(md) {
+    const refs = [];
+    mapOutsideFences(md, t => { for (const m of t.matchAll(IMAGE_RE)) refs.push(parseImageMatch(m)); return t; });
+    return refs;
+}
+
+function replaceImageRefs(md, fn) {
+    return mapOutsideFences(md, t => t.replace(IMAGE_RE, (...m) => fn(parseImageMatch(m))));
+}
+
+// ctx: { resolvePath(src) -> vaultPath|null, readBinary(path) -> Buffer|ArrayBuffer, api(method, path, opts),
+//        imageCache: { [auditId]: { [sha256]: imageId } }, save() }
+// ponytail: a cached id is trusted; an image deleted in PwnDoc is not re-uploaded until the cache entry is removed
+async function uploadImage(ctx, auditId, src) {
+    if (/^https?:\/\//i.test(src)) throw new Error(`remote image not supported: ${src}`);
+    const path = ctx.resolvePath(src);
+    if (!path) throw new Error(`missing image: ${src}`);
+    const ext = path.split('.').pop().toLowerCase();
+    if (!IMAGE_MIME[ext]) throw new Error(`unsupported image type: ${path}`);
+    const bytes = Buffer.from(await ctx.readBinary(path));
+    if (bytes.length > MAX_IMAGE_BYTES) throw new Error(`image too large (${(bytes.length / 1048576).toFixed(1)} MB, max 12): ${path}`);
+    const hash = require('crypto').createHash('sha256').update(bytes).digest('hex');
+    const cached = ctx.imageCache[auditId]?.[hash];
+    if (cached) return cached;
+    const res = await ctx.api('POST', '/api/images', {
+        body: { value: `data:${IMAGE_MIME[ext]};base64,${bytes.toString('base64')}`, name: path.split('/').pop(), auditId },
+    });
+    (ctx.imageCache[auditId] ||= {})[hash] = res._id;
+    await ctx.save();
+    return res._id;
+}
+
+// Upload every image of a section and swap the refs for tokens; throws before replacing anything if one fails
+async function tokenizeImages(ctx, auditId, md) {
+    const ids = new Map();
+    for (const r of extractImageRefs(md)) if (!ids.has(r.src)) ids.set(r.src, await uploadImage(ctx, auditId, r.src));
+    return replaceImageRefs(md, r => imgToken(ids.get(r.src), r.alt));
+}
+
+// ctx: { api, exists(path), writeBinary(path, Buffer) }
+async function downloadImage(ctx, imageId, destFolder) {
+    const meta = await ctx.api('GET', `/api/images/${imageId}`);
+    const m = /^data:(image\/[a-z]+);base64,(.*)$/s.exec(meta.value || '');
+    if (!m || !MIME_EXT[m[1]]) throw new Error(`unsupported image in PwnDoc: ${imageId}`);
+    const path = `${destFolder ? destFolder + '/' : ''}${imageId}.${MIME_EXT[m[1]]}`;
+    if (!(await ctx.exists(path))) await ctx.writeBinary(path, Buffer.from(m[2], 'base64'));
+    return path;
+}
+
+// Rewrite ![alt](<pwndoc image id>) from a pulled section into vault paths, downloading what is missing
+async function pullImages(ctx, md, destFolder) {
+    const paths = new Map();
+    for (const r of extractImageRefs(md)) {
+        if (/^[0-9a-f]{24}$/.test(r.src) && !paths.has(r.src)) paths.set(r.src, await downloadImage(ctx, r.src, destFolder));
+    }
+    return replaceImageRefs(md, r => (paths.has(r.src) ? `![${r.alt}](${encodeURI(paths.get(r.src))})` : r.raw));
+}
+
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
 async function readFilePath(app, filePath) {
     if (/^([A-Za-z]:[\\/]|\/)/.test(filePath)) {
@@ -1350,4 +1442,5 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings };
+module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
+    extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages };
