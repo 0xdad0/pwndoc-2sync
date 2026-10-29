@@ -1125,6 +1125,32 @@ async function setAuditTemplate(ctx, { auditId, templateId, force }) {
     return { changed: true, previous };
 }
 
+// ── General information of the engagement: what the export needs ──────────────
+const GENERAL_FIELDS = {
+    name: 'Name', auditType: 'Audit type', language: 'Language', template: 'Template', company: 'Company', client: 'Client',
+    date: 'Report date', date_start: 'Start date', date_end: 'End date', location: 'Location', scope: 'Scope',
+};
+const DEFAULT_GENERAL_REQUIRED = ['name', 'auditType', 'language', 'template', 'company', 'client', 'date_start', 'date_end'];
+
+// Blank = nothing a template could print: empty text, empty list, or an object (company, client, template) with no value in it
+const isBlankValue = v => v == null || (typeof v === 'string' ? v.trim() === '' : Array.isArray(v) ? v.length === 0
+    : typeof v === 'object' ? Object.values(v).every(isBlankValue) : false);
+
+// [{ key, label }] of the mandatory General Information fields the audit leaves blank, then the required custom fields
+// of the general section. required: keys of GENERAL_FIELDS; cfDefs: GET /api/data/custom-fields
+function missingGeneralFields(audit, required, cfDefs = []) {
+    const out = required.filter(k => isBlankValue(audit[k])).map(k => ({ key: k, label: GENERAL_FIELDS[k] || k }));
+    for (const d of cfDefs.filter(x => x.required && x.display === 'general')) {
+        const entry = (audit.customFields || []).find(c => (c.customField?._id ?? c.customField) === d._id);
+        if (isBlankValue(entry?.text)) out.push({ key: `cf:${d._id}`, label: d.label || d._id });
+    }
+    return out;
+}
+
+const reportFailureLines = (error, auditName, missing) => [`The export of "${auditName}" failed: ${error.message}`,
+    ...(missing.length ? ['Missing in General Information:', ...missing.map(m => `- ${m.label}`), 'Fill them in on PwnDoc (Audit, General) and generate the report again.']
+        : ['The General Information looks complete: check the placeholders of the template and the PwnDoc server log.'])];
+
 // PwnDoc renders the report with the template stored on the audit, so that is the one used here
 async function generateReport(ctx, { auditId }) {
     const audit = await ctx.api('GET', `/api/audits/${auditId}`);
@@ -1315,6 +1341,7 @@ const DEFAULT_SETTINGS = {
     watchRemote:     true,  // warn when PwnDoc changed a synced section of the open note
     watchIntervalMin: 5,    // 0 = only when a note is opened
     reportsFolder:   'reports', // where generated reports are saved (vault path)
+    generalRequired: DEFAULT_GENERAL_REQUIRED.join(','), // General Information fields checked when an export fails
 };
 
 // ── Modal: fuzzy search over vuln list ────────────────────────────────────────
@@ -1749,6 +1776,13 @@ class PwnDocSettingTab extends PluginSettingTab {
                     const n = parseInt(v, 10);
                     if (n >= 0) { this.plugin.settings.watchIntervalMin = n; await this.plugin.saveSettings(); }
                 }));
+
+        new Setting(containerEl)
+            .setName('Mandatory General Information fields')
+            .setDesc('Checked when a report export fails (and by "Check the General Information"). Comma separated keys: ' + Object.keys(GENERAL_FIELDS).join(', '))
+            .addText(t => t
+                .setValue(this.plugin.settings.generalRequired)
+                .onChange(async v => { this.plugin.settings.generalRequired = v.trim(); await this.plugin.saveSettings(); }));
 
         new Setting(containerEl)
             .setName('Reports folder')
@@ -2240,6 +2274,18 @@ class PromptModal extends Modal {
     onClose() { this.contentEl.empty(); if (!this.done) this.onSubmit(null); }
 }
 
+// ── Modal: a titled list of lines ─────────────────────────────────────────────
+class InfoModal extends Modal {
+    constructor(app, title, lines) { super(app); this.title = title; this.lines = lines; }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl('h3', { text: this.title });
+        for (const l of this.lines) contentEl.createEl('div', { text: l }).style.cssText = 'margin:2px 0;white-space:pre-wrap;';
+        contentEl.createEl('button', { text: 'Close' }).onclick = () => this.close();
+    }
+    onClose() { this.contentEl.empty(); }
+}
+
 // ── Modal: choose the report template ─────────────────────────────────────────
 class TemplatePickModal extends SuggestModal {
     constructor(app, templates, currentId, onChoose) {
@@ -2464,6 +2510,7 @@ class PwnDocImporterPlugin extends Plugin {
         cmd('find-orphans', 'Find orphan notes (finding or engagement gone from PwnDoc)', () => this.findOrphans());
         cmd('finding-completed', 'Mark PwnDoc finding as completed', () => this.setCompleted(true));
         cmd('finding-reopen', 'Reopen PwnDoc finding (in progress)', () => this.setCompleted(false));
+        cmd('check-general-information', 'Check the General Information of the engagement (mandatory fields)', () => this.checkGeneralCommand());
         cmd('set-report-template', 'Choose the report template of the engagement', () => this.setTemplateCommand());
         cmd('generate-report', 'Generate PwnDoc report (docx from the engagement template)', () => this.generateReportCommand());
         this.addCommand({
@@ -2800,6 +2847,7 @@ class PwnDocImporterPlugin extends Plugin {
         menu.addSeparator();
         item('Engagement dashboard', 'layout-dashboard', () => this.openDashboard());
         item('Find orphan notes', 'search-x', () => this.findOrphans());
+        item('Check General Information', 'clipboard-check', () => this.checkGeneralCommand());
         item('Choose report template', 'file-cog', () => this.setTemplateCommand());
         item('Generate report', 'file-output', () => this.generateReportCommand());
         menu.addSeparator();
@@ -3089,6 +3137,7 @@ class PwnDocImporterPlugin extends Plugin {
             const defs = (await this.api('GET', '/api/data/custom-fields')) || [];
             this.cfLabels = { ...Object.fromEntries(defs.map(d => [d._id, d.label])), ...this.cfLabels };
             this.cfTypes = Object.fromEntries(defs.map(d => [d._id, d.fieldType]));
+            this.cfDefs = defs;
         } catch (e) { this.dbg('custom field definitions not loaded:', e.message); }
     }
 
@@ -3293,6 +3342,34 @@ class PwnDocImporterPlugin extends Plugin {
         } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
     }
 
+    // Why did the export fail? Check the General Information of the engagement and show what is missing
+    async explainReportFailure(auditId, error) {
+        let audit = { name: auditId };
+        let missing = [];
+        try {
+            await this.loadCustomFieldDefs();
+            audit = await this.api('GET', `/api/audits/${auditId}`);
+            missing = missingGeneralFields(audit, this.generalRequired(), this.cfDefs || []);
+        } catch (e) { this.dbg('general information check failed:', e.message); }
+        new InfoModal(this.app, 'Report export failed', reportFailureLines(error, audit.name, missing)).open();
+    }
+
+    generalRequired() {
+        return String(this.settings.generalRequired || '').split(',').map(k => k.trim()).filter(Boolean);
+    }
+
+    async checkGeneralCommand() {
+        try {
+            const auditId = await this.currentAuditId();
+            if (!auditId) return;
+            await this.loadCustomFieldDefs();
+            const audit = await this.api('GET', `/api/audits/${auditId}`);
+            const missing = missingGeneralFields(audit, this.generalRequired(), this.cfDefs || []);
+            new InfoModal(this.app, `General Information of "${audit.name}"`,
+                missing.length ? ['Missing:', ...missing.map(m => `- ${m.label}`)] : ['All the mandatory fields are filled in.']).open();
+        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+    }
+
     // Generate the report of an engagement from the template stored on it (asked for when there is none) and save it in the vault
     async generateReportCommand() {
         try {
@@ -3304,6 +3381,7 @@ class PwnDocImporterPlugin extends Plugin {
             const notice = new Notice('PwnDoc Importer: generating the report…', 0);
             let r;
             try { r = await generateReport({ api: (m, p, o) => this.api(m, p, o) }, { auditId }); }
+            catch (e) { notice.hide(); console.error(e); await this.explainReportFailure(auditId, e); return; }
             finally { notice.hide(); }
             const adapter = this.app.vault.adapter;
             const folder = this.settings.reportsFolder;
@@ -3489,7 +3567,7 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
+module.exports.__test = { missingGeneralFields, reportFailureLines, GENERAL_FIELDS, DEFAULT_GENERAL_REQUIRED, setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
     sideBySide, missingFindings, findingToNoteRow, IMPORT_SECTIONS, folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,

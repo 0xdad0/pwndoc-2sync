@@ -216,6 +216,7 @@ The report template is a property of the **engagement** on PwnDoc, and the repor
 
 - **Choose the report template of the engagement** lists the templates of the PwnDoc instance (the current one first and marked) and stores the pick on the audit. It is a write to the audit, so it requires state `EDIT` or **Enforce**; the notice tells which template it replaced, so changing it back is one more run of the command. Choosing the template already in use does nothing. The dashboard title shows the current template.
 - **Generate PwnDoc report** renders the engagement with its template and saves the file (`.docx`, or the extension of the template) in the **Reports folder**, then opens it with the default application. If the engagement has no template yet it first asks you to choose one.
+- **When the export fails** the plugin reads the **General Information** of the engagement and lists the mandatory fields that are blank (by default name, audit type, language, template, company, client, start date, end date, plus the custom fields marked required in the general section), together with the PwnDoc error, so you know what to fill in on PwnDoc. If nothing is missing it says so and points at the template placeholders and the server log. **Check the General Information of the engagement** runs the same check on demand. The list of fields is the setting *Mandatory General Information fields* (keys: `name`, `auditType`, `language`, `template`, `company`, `client`, `date`, `date_start`, `date_end`, `location`, `scope`).
 
 ### Images with figure captions
 
@@ -236,6 +237,7 @@ The history folder contains client data: do not commit it (`history/` is git-ign
 | **Warn about changes on PwnDoc** | on | Check the open note against PwnDoc |
 | **Check interval (minutes)** | `5` | `0` = only when a note is opened (reload the plugin to apply) |
 | **Reports folder** | `reports` | Where generated reports are saved |
+| **Mandatory General Information fields** | `name,auditType,language,template,company,client,date_start,date_end` | Checked when an export fails |
 
 ## Generated Note Structure
 

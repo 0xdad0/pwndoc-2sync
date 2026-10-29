@@ -1191,3 +1191,35 @@ test('templateLabel names the template of an audit, or says there is none', () =
     assert.equal(T.templateLabel({ template: 'zz' }, ts), 'unknown template');
     assert.equal(T.templateLabel({}, ts), 'no template');
 });
+
+// ── general information check when the export fails ───────────────────────────
+const GEN_OK = { name: 'Acme', auditType: 'WAPT', language: 'IT-it', template: { _id: 't1' }, company: { name: 'Acme srl' }, client: { _id: 'c1', email: 'a@b.it' },
+    date: '2026-10-01', date_start: '2026-10-05', date_end: '2026-10-09', customFields: [] };
+
+test('missingGeneralFields lists the blank mandatory fields of the General Information, in order', () => {
+    const req = ['name', 'auditType', 'language', 'template', 'company', 'client', 'date_start', 'date_end'];
+    assert.deepEqual(T.missingGeneralFields(GEN_OK, req), []);
+    const bad = { ...GEN_OK, template: null, client: {}, company: undefined, date_start: '', date_end: '  ', auditType: '' };
+    assert.deepEqual(T.missingGeneralFields(bad, req).map(f => f.key), ['auditType', 'template', 'company', 'client', 'date_start', 'date_end']);
+    assert.deepEqual(T.missingGeneralFields({ ...GEN_OK, company: { name: '' } }, ['company']).map(f => f.label), ['Company']);
+});
+
+test('missingGeneralFields also checks the required custom fields shown in the general information', () => {
+    const defs = [
+        { _id: 'c1', label: 'Test window', required: true, display: 'general' },
+        { _id: 'c2', label: 'Auth', required: true, display: 'general' },
+        { _id: 'c3', label: 'Finding only', required: true, display: 'finding' },
+        { _id: 'c4', label: 'Optional', required: false, display: 'general' },
+    ];
+    const audit = { ...GEN_OK, customFields: [{ customField: { _id: 'c1' }, text: 'night' }, { customField: 'c4', text: '' }] };
+    assert.deepEqual(T.missingGeneralFields(audit, [], defs).map(f => f.label), ['Auth']);
+    assert.deepEqual(T.missingGeneralFields({ ...audit, customFields: [{ customField: 'c1', text: ' ' }] }, [], defs).map(f => f.label), ['Test window', 'Auth']);
+});
+
+test('reportFailureLines names the missing fields, or says the general information looks complete', () => {
+    const e = new Error('HTTP 500: template error');
+    assert.deepEqual(T.reportFailureLines(e, 'Acme', [{ label: 'Client' }, { label: 'Start date' }]), [
+        'The export of "Acme" failed: HTTP 500: template error',
+        'Missing in General Information:', '- Client', '- Start date', 'Fill them in on PwnDoc (Audit, General) and generate the report again.']);
+    assert.match(T.reportFailureLines(e, 'Acme', []).join('\n'), /looks complete.*template/s);
+});
