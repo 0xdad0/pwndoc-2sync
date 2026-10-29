@@ -144,6 +144,7 @@ function replaceSection(md, key, newText) {
 const ALLOWED_TAGS = new Set(['p', 'ul', 'ol', 'li', 'strong', 'em', 'code', 'pre', 'a', 'br', 'blockquote',
     'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table', 'thead', 'tbody', 'tr', 'th', 'td']);
 const DROP_TAGS = new Set(['script', 'style', 'button', 'iframe', 'object', 'embed']);
+const TAG_ALIAS = { b: 'strong', i: 'em' };
 
 const escHtml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const escAttr = s => escHtml(s).replace(/"/g, '&quot;');
@@ -153,7 +154,7 @@ const escAttr = s => escHtml(s).replace(/"/g, '&quot;');
 function serializeWhitelist(node, imgResolver = () => null) {
     if (node.nodeType === 3) return escHtml(node.textContent);
     if (node.nodeType !== 1) return '';
-    const tag = node.tagName.toLowerCase();
+    const tag = TAG_ALIAS[node.tagName.toLowerCase()] || node.tagName.toLowerCase();
     if (DROP_TAGS.has(tag)) return '';
     if (tag === 'pre') return `<pre><code>${escHtml(textWithoutDropped(node))}</code></pre>`;
     if (tag === 'img') {
@@ -184,19 +185,22 @@ const expandImgTokens = html => html.replace(IMG_TOKEN_RE, (_, id, hex) =>
     `<img src="${id}" alt="${escAttr(Buffer.from(hex, 'hex').toString('utf8'))}">`);
 
 // Runtime-only (needs Obsidian): markdown -> PwnDoc HTML
-async function mdToHtml(app, md) {
+async function mdToHtml(app, md, strict = false) {
     const div = document.createElement('div');
     const comp = new Component();
     comp.load();
     try { await MarkdownRenderer.render(app, md, div, '', comp); }
     finally { comp.unload(); }
-    return expandImgTokens(serializeWhitelist(div));
+    return expandImgTokens(serializeWhitelist(div, strict ? strictImageResolver : undefined));
 }
 
-const htmlToMd = html => (html ? htmlToMarkdown(html).trim() : '');
+const htmlToMd = (html, { convert = htmlToMarkdown, parse } = {}) =>
+    (html ? demoteHeadings(convert(sanitizeHtml(html, parse)).trim()) : '');
 
 // Comparison form: both sides pass through the same renderer so formatting noise cancels out
-async function normalizeMd(app, md) { return htmlToMd(await mdToHtml(app, md)); }
+async function normalizeMd(app, md, keyOf = async src => src) {
+    return withImagesPreserved(md, keyOf, async m => htmlToMd(await mdToHtml(app, m)));
+}
 
 // ── Engagement association ────────────────────────────────────────────────────
 const parentDir = p => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
@@ -244,7 +248,7 @@ const pwndocGetAudit = (baseUrl, token, id, ignoreSsl) =>
 const IMAGE_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
 const MIME_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
 const MAX_IMAGE_BYTES = 12 * 1024 * 1024; // PwnDoc rejects bodies above ~17.8 MB, base64 adds a third
-const IMAGE_RE = /!\[\[([^\]|\n]+)(?:\|([^\]\n]*))?\]\]|!\[([^\]]*)\]\(([^)\n]*)\)/g;
+const IMAGE_RE = /!\[\[([^\]|\n]+)(?:\|([^\]\n]*))?\]\]|!\[((?:[^\[\]\n]|\[[^\]\n]*\])*)\]\(([^)\n]*)\)/g;
 const SIZE_SUFFIX_RE = /^\d+(x\d+)?$/;
 
 // Apply fn to the text outside ``` / ~~~ code fences
@@ -386,7 +390,7 @@ async function buildComparison(ctx, noteMd, finding, keys, noteInfo = {}, base =
             remote = renderCustomFields(finding, ctx);
         } else {
             local = localRaw.trim();
-            remote = String(finding[def.field] || '').trim();
+            remote = def.key === 'title' ? sanitizeTitle(finding.title) : String(finding[def.field] || '').trim();
         }
         const baseText = base?.sections?.[key];
         const status = classify(baseText, local, remote);
@@ -512,11 +516,13 @@ async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapsho
     const baseSections = {};
     for (const def of defs) {
         const text = def.source ? localValue({ ...ctx.noteInfo, md: noteMd }, def) : secs[def.key]?.text || '';
-        if (text === '' && !isEmptyValue(fresh[def.field]) && !(await ctx.confirmEmpty(def.key, 'push'))) {
+        const value = await localToRemote(ctx, auditId, def, text);
+        if (isEmptyValue(value) && !isEmptyValue(fresh[def.field]) && !(await ctx.confirmEmpty(def.key, 'push'))) {
             throw new Error(`local section ${def.key} is empty, refusing to blank it on PwnDoc`);
         }
-        patch[def.field] = await localToRemote(ctx, auditId, def, text);
         baseSections[def.key] = await comparisonForm(ctx, def, text);
+        if (def.key === 'title' && text === sanitizeTitle(fresh.title)) continue; // differs only by filename sanitising
+        patch[def.field] = value;
     }
     const ts = new Date().toISOString();
     const entryId = await recordHistory(ctx.adapter, ctx.historyDir, {
@@ -541,7 +547,7 @@ async function pullSections(ctx, { auditId, findingId, noteMd, sections }) {
     for (const def of defs) {
         if (def.source) {
             meta[def.key] = String(fresh[def.field] ?? '');
-            baseSections[def.key] = meta[def.key].trim();
+            baseSections[def.key] = def.key === 'title' ? sanitizeTitle(meta[def.key]) : meta[def.key].trim();
             continue;
         }
         if (isEmptyValue(fresh[def.field]) && (secs[def.key]?.text || '') !== '' && !(await ctx.confirmEmpty(def.key, 'pull'))) {
@@ -759,6 +765,57 @@ async function createFinding(ctx, auditId, body, force) {
     const created = (after.findings || []).find(f => !known.has(f._id));
     if (!created) throw new Error('finding created but not found in the audit afterwards');
     return created._id;
+}
+
+// ── Review fixes: image-safe comparison, pull sanitising, strict push ─────────
+const sanitizeTitle = t => String(t ?? '').replace(FILENAME_UNSAFE_RE, '-').trim();
+
+// Push resolver: any <img> that did not come from an uploaded token is an unsupported syntax, never silently dropped
+function strictImageResolver(src, alt) {
+    throw new Error(`unrecognised image syntax in the section, it would not be uploaded: ${alt || src}`);
+}
+
+// A pulled heading must never become a section boundary of the note
+function demoteHeadings(md) {
+    return mapOutsideFences(md, t => t.replace(/^#{1,2} /gm, '### '));
+}
+
+const defaultParse = html => new DOMParser().parseFromString(html, 'text/html').body;
+// PwnDoc HTML is untrusted on its way into the vault: same whitelist as the push side, images kept
+function sanitizeHtml(html, parse = defaultParse) {
+    return serializeWhitelist(parse(html), src => src);
+}
+
+// The same picture gets the same key on both sides: PwnDoc id, id embedded in a pulled file name,
+// id of identical content already uploaded to this audit, else the path itself
+async function canonicalImageKey(ctx, auditId, src) {
+    if (/^[0-9a-f]{24}$/.test(src)) return src;
+    const named = src.split('/').pop().match(/^([0-9a-f]{24})\.[a-z]+$/i);
+    if (named) return named[1];
+    const path = ctx.resolvePath(src);
+    if (!path) return src;
+    try {
+        const hash = require('crypto').createHash('sha256').update(Buffer.from(await ctx.readBinary(path))).digest('hex');
+        return ctx.imageCache[auditId]?.[hash] || src;
+    } catch { return src; }
+}
+
+// normalizeCore (render + htmlToMd) drops images; park them as tokens around it and restore them as ![alt](key)
+const CMP_TOKEN_RE = /⟦pwcmp:(\d+)⟧/g;
+async function withImagesPreserved(md, keyOf, normalizeCore) {
+    const refs = extractImageRefs(md);
+    const keys = [];
+    for (const r of refs) keys.push(await keyOf(r.src));
+    let i = 0;
+    const parked = replaceImageRefs(md, () => `⟦pwcmp:${i++}⟧`);
+    return (await normalizeCore(parked)).replace(CMP_TOKEN_RE, (_, n) => `![${refs[n].alt}](${keys[n]})`);
+}
+
+// Explicit ids win over the metadata cache, which lags behind a frontmatter write
+function resolveFindingLink(notePath, fm, folderAudits, override = {}) {
+    const findingId = override.findingId ?? fm?.pwndoc_finding_id;
+    const auditId = override.auditId ?? resolveAuditId(notePath, fm, folderAudits);
+    return auditId && findingId ? { auditId, findingId } : null;
 }
 
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
@@ -1080,10 +1137,11 @@ function rowsToCsv(rows) {
 
 // ── Modal: PwnDoc API credentials ────────────────────────────────────────────
 class ApiCredentialsModal extends Modal {
-    constructor(app, settings, onConnect) {
+    constructor(app, settings, onConnect, onDismiss) {
         super(app);
         this.settings  = settings;
         this.onConnect = onConnect; // ({url, username, password, ignoreSsl, save}) => void
+        this.onDismiss = onDismiss; // () => void, when closed without connecting
     }
 
     onOpen() {
@@ -1143,6 +1201,7 @@ class ApiCredentialsModal extends Modal {
             if (!url)      { new Notice('Please enter the PwnDoc URL.');  return; }
             if (!username) { new Notice('Please enter your username.');    return; }
             if (!password) { new Notice('Please enter your password.');    return; }
+            this.done = true;
             this.close();
             this.onConnect({ url, username, password, ignoreSsl: sslCheck.checked, save: saveCheck.checked });
         };
@@ -1151,7 +1210,7 @@ class ApiCredentialsModal extends Modal {
         urlInput.focus();
     }
 
-    onClose() { this.contentEl.empty(); }
+    onClose() { this.contentEl.empty(); if (!this.done) this.onDismiss?.(); }
 }
 
 // ── Modal: choose where to save the fetched CSV ───────────────────────────────
@@ -1458,7 +1517,8 @@ class AuditPickModal extends FuzzySuggestModal {
             cls: 'pwndoc-meta',
         });
     }
-    onChooseItem(a) { this.onChoose(a); }
+    onChooseItem(a) { this.chosen = true; this.onChoose(a); }
+    onClose() { super.onClose(); setTimeout(() => { if (!this.chosen) this.onChoose(null); }, 0); }
 }
 
 // ── Modal: choose a finding of the audit (best title match first) ─────────────
@@ -1476,7 +1536,8 @@ class FindingPickModal extends FuzzySuggestModal {
         el.createEl('div', { text: f.title || f._id });
         el.createEl('small', { text: [`#${f.identifier}`, f.vulnType, f.cvssv3].filter(Boolean).join(' · '), cls: 'pwndoc-meta' });
     }
-    onChooseItem(f) { this.onChoose(f); }
+    onChooseItem(f) { this.chosen = true; this.onChoose(f); }
+    onClose() { super.onClose(); setTimeout(() => { if (!this.chosen) this.onChoose(null); }, 0); }
 }
 
 // ── Modal: yes/no confirmation ────────────────────────────────────────────────
@@ -1925,8 +1986,14 @@ class PwnDocImporterPlugin extends Plugin {
         const password = getApiPassword(this.app, s);
         const creds = (s.apiUrl && s.apiUsername && password)
             ? { url: s.apiUrl, username: s.apiUsername, password, ignoreSsl: s.apiIgnoreSsl }
-            : await new Promise(resolve => new ApiCredentialsModal(this.app, s, resolve).open());
+            : await new Promise(resolve => new ApiCredentialsModal(this.app, s, resolve, () => resolve(null)).open());
+        if (!creds) throw new Error('login cancelled');
         const token = await pwndocLogin(creds.url, creds.username, creds.password, creds.ignoreSsl);
+        if (creds.save) {
+            Object.assign(this.settings, { apiUrl: creds.url, apiUsername: creds.username, apiIgnoreSsl: creds.ignoreSsl });
+            this.app.secretStorage.setSecret(this.settings.apiPasswordSecret || SECRET_ID, creds.password);
+            await this.saveSettings();
+        }
         this._session = { url: creds.url, token, ignoreSsl: creds.ignoreSsl };
         return this._session;
     }
@@ -1984,6 +2051,7 @@ class PwnDocImporterPlugin extends Plugin {
         }
         if (!audit.findings?.length) { new Notice('PwnDoc Importer: this audit has no findings yet.'); return; }
         new FindingPickModal(this.app, audit.findings, title, async finding => {
+            if (!finding) return;
             await this.app.fileManager.processFrontMatter(file, fm => {
                 fm.pwndoc_audit_id = auditId;
                 fm.pwndoc_finding_id = finding._id;
@@ -1995,16 +2063,15 @@ class PwnDocImporterPlugin extends Plugin {
     // ── Engagement sync: compare / merge ─────────────────────────────────────────
 
     // Everything the push/pull pipeline needs from the Obsidian side
-    syncCtx(file, findingId) {
+    syncCtx(file, findingId, auditId) {
         const app = this.app;
         const adapter = app.vault.adapter;
-        return {
+        const ctx = {
             notePath: file.path,
             noteInfo: { basename: file.basename, fm: app.metadataCache.getFileCache(file)?.frontmatter || {} },
             api: (m, p, o) => this.api(m, p, o),
-            mdToHtml: md => mdToHtml(app, md),
+            mdToHtml: md => mdToHtml(app, md, true),
             htmlToMd,
-            normalize: md => normalizeMd(app, md),
             cfLabels: this.cfLabels || {},
             resolvePath: src => (app.metadataCache.getFirstLinkpathDest(src, file.path)
                 ?? app.vault.getAbstractFileByPath(normalizePath(`${parentDir(file.path)}/${src}`)))?.path ?? null,
@@ -2027,19 +2094,20 @@ class PwnDocImporterPlugin extends Plugin {
                     : `PwnDoc has no content in "${labelOf(defOf(key))}" but the note does. Overwrite the note section with an empty one?`,
                 resolve).open()),
         };
+        ctx.normalize = md => normalizeMd(app, md, src => canonicalImageKey(ctx, auditId, src));
+        return ctx;
     }
 
-    async compareWithPwndoc() {
+    async compareWithPwndoc(override = {}) {
         const file = this.app.workspace.getActiveFile();
         const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
         if (!file) { new Notice('PwnDoc Importer: open a note first.'); return; }
-        if (!fm?.pwndoc_finding_id) { new Notice('PwnDoc Importer: associate this note to a finding first.'); return; }
-        const auditId = resolveAuditId(file.path, fm, this.settings.folderAudits);
-        const findingId = fm.pwndoc_finding_id;
-        if (!auditId) { new Notice('PwnDoc Importer: no engagement associated to this note or its folders.'); return; }
+        const link = resolveFindingLink(file.path, fm, this.settings.folderAudits, override);
+        if (!link) { new Notice('PwnDoc Importer: associate this note to a finding first.'); return; }
+        const { auditId, findingId } = link;
 
         let audit, finding, rows, noteMd;
-        const ctx = this.syncCtx(file, findingId);
+        const ctx = this.syncCtx(file, findingId, auditId);
         try {
             ({ audit, finding } = await fetchFinding(ctx, auditId, findingId));
             noteMd = await this.app.vault.read(file);
@@ -2076,7 +2144,7 @@ class PwnDocImporterPlugin extends Plugin {
         if (!fm?.pwndoc_finding_id) { new Notice('PwnDoc Importer: associate this note to a finding first.'); return; }
         const auditId = resolveAuditId(file.path, fm, this.settings.folderAudits);
         const findingId = fm.pwndoc_finding_id;
-        const ctx = this.syncCtx(file, findingId);
+        const ctx = this.syncCtx(file, findingId, auditId);
         const entries = await listHistory(ctx.adapter, ctx.historyDir);
         if (!entries.length) { new Notice('PwnDoc Importer: no history for this finding yet.'); return; }
 
@@ -2155,7 +2223,7 @@ class PwnDocImporterPlugin extends Plugin {
                 sections: [], remoteBefore: null, localBefore: await this.app.vault.read(file),
             }, this.settings.historyLimit);
             new Notice(`PwnDoc Importer: created "${body.title}"`);
-            await this.compareWithPwndoc(); // opens the merge with Evidence preselected
+            await this.compareWithPwndoc({ auditId, findingId }); // opens the merge with Evidence preselected
         } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
     }
 
@@ -2311,6 +2379,7 @@ module.exports = PwnDocImporterPlugin;
 module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
+    canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,
     matchFinding, buildFindingFromLibrary, buildFindingFromNote, createFinding, classify, merge3, hasConflictMarkers, applyMerged, isValidCvss31, cvssFrontmatter, localValue, labelOf, historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase,
     AuditLockedError, assertEditable, findingHash, assertUnchanged, isEmptyValue, pushSections, pullSections,
     restoreRemotePatch, restoreLocal, buildRollbackComparison, rollbackSections };

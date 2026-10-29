@@ -155,7 +155,7 @@ Link notes to a PwnDoc **engagement (audit)**, compare them with the matching **
 
 Every push, pull, merge, rollback and finding creation stores the finding and the note as they were **before** the operation in `<vault>/.obsidian/plugins/pwndoc-importer/history/<findingId>/` (the last *History entries per finding* are kept). **Restore from PwnDoc sync history (rollback)** lets you pick an entry and restore chosen sections either on PwnDoc or in the note, through the same diff dialog and guards. A rollback is itself recorded, so it can be rolled back. Uploaded images are never deleted, so restored evidence keeps its pictures.
 
-The history folder contains client data: do not commit it (`history/` and `data.json` are git-ignored in this repository).
+The history folder contains client data: do not commit it (`history/` is git-ignored in this repository). `data.json` also stores the engagement names you associate and the API address, so keep it out of version control if you share this folder.
 
 ### Settings
 

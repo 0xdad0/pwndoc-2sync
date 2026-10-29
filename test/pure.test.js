@@ -722,3 +722,88 @@ test('createFinding returns the id of the newly created finding even when titles
     const id = await T.createFinding(ctx, AID, { title: 'existing' }, false);
     assert.equal(id, 'n'.repeat(24));
 });
+
+// ── final review fixes ────────────────────────────────────────────────────────
+const PNGB = Buffer.from('PNGDATA');
+
+test('F1 canonicalImageKey maps vault paths and PwnDoc ids to the same key', async () => {
+    const ID = 'a1'.repeat(12);
+    const hash = require('crypto').createHash('sha256').update(PNGB).digest('hex');
+    const ctx = { resolvePath: s => (s.startsWith('shots/') ? s : null), readBinary: async () => PNGB, imageCache: { AUD: { [hash]: ID } } };
+    assert.equal(await T.canonicalImageKey(ctx, 'AUD', ID), ID);
+    assert.equal(await T.canonicalImageKey(ctx, 'AUD', `attachments/${ID}.png`), ID);
+    assert.equal(await T.canonicalImageKey(ctx, 'AUD', 'shots/login.png'), ID);          // uploaded before: found by content hash
+    assert.equal(await T.canonicalImageKey({ ...ctx, imageCache: {} }, 'AUD', 'shots/new.png'), 'shots/new.png'); // never uploaded
+    assert.equal(await T.canonicalImageKey(ctx, 'AUD', 'https://x.io/a.png'), 'https://x.io/a.png');
+});
+
+test('F1 withImagesPreserved keeps screenshots through normalisation so merges and diffs do not lose them', async () => {
+    const core = async m => m.replace(/\s+/g, ' ').trim(); // stand-in for render + htmlToMd, which would drop images
+    const keyOf = async src => src.replace(/^attachments\//, '').replace(/\.png$/, '');
+    const local = await T.withImagesPreserved('Step 1\n\n![Fig](attachments/AAA.png)', keyOf, core);
+    const remote = await T.withImagesPreserved('Step 1\n\n![Fig](AAA)', keyOf, core);
+    assert.equal(local, remote);
+    assert.match(local, /!\[Fig\]\(AAA\)/);
+    assert.notEqual(await T.withImagesPreserved('Step 1', keyOf, core), local);
+});
+
+test('F1 buildComparison sees a screenshot-only difference and treats an image-only Evidenza as non-empty', async () => {
+    const keyOf = async src => src.replace(/^attachments\//, '').replace(/\.png$/, '');
+    const ctx = {
+        ...cmpCtx,
+        normalize: md => T.withImagesPreserved(md, keyOf, async m => m.trim()),
+        htmlToMd: html => html.replace(/<\/p><p>/g, '\n\n').replace(/<img src="([^"]+)" alt="([^"]*)">/g, '![$2]($1)').replace(/<[^>]+>/g, '').trim(),
+    };
+    const finding = { ...FINDING, poc: '<p>Step 1</p><p><img src="AAA" alt="Fig"></p>' };
+    const same = await T.buildComparison(ctx, '## Evidenza\n\nStep 1\n\n![Fig](attachments/AAA.png)\n', finding, ['poc']);
+    assert.equal(same[0].changed, false);
+    const removed = await T.buildComparison(ctx, '## Evidenza\n\nStep 1\n', finding, ['poc']);
+    assert.equal(removed[0].changed, true);
+    const only = await T.buildComparison(ctx, '## Evidenza\n\n![Fig](attachments/AAA.png)\n', { ...FINDING, poc: '' }, ['poc']);
+    assert.equal(only[0].localEmpty, false);
+});
+
+test('F2 pushSections guards on what would be written: an Evidenza that renders to nothing is not a free pass to blank PwnDoc', async () => {
+    const ctx = syncCtx({ confirmEmpty: async () => false });
+    ctx.mdToHtml = async () => '';                       // e.g. only an Obsidian %% comment %%
+    await assert.rejects(T.pushSections(ctx, pushArgs(ctx, { noteMd: '## Evidenza\n\n%% TODO add screenshots %%\n' })), /empty/i);
+    assert.equal(ctx.log.puts.length, 0);
+});
+
+test('F3 images with brackets in the caption are extracted, and unrecognised images fail a push instead of vanishing', () => {
+    assert.deepEqual(T.extractImageRefs('![Fig [1]](a.png)').map(r => [r.alt, r.src]), [['Fig [1]', 'a.png']]);
+    assert.throws(() => T.serializeWhitelist(el('p', {}, el('img', { src: 'app://x/a.png', alt: 'a' })), T.strictImageResolver), /unrecognised image/);
+});
+
+test('F4 demoteHeadings turns # and ## outside fences into ###, so pulled content cannot split the note', () => {
+    assert.equal(T.demoteHeadings('## Step 1\n\ntext\n\n```\n## code\n```\n# Top\n#### deep'), '### Step 1\n\ntext\n\n```\n## code\n```\n### Top\n#### deep');
+    const md = T.htmlToMd('<h2>Remediation</h2><p>x</p>', { convert: h => '## Remediation\n\nx', parse: () => el('body', {}) });
+    assert.equal(md, '### Remediation\n\nx');
+    const note = T.replaceSection('## Evidenza\n\n\n## Assets\n\na\n', 'poc', md);
+    assert.equal(T.parseSections(note).poc.text, md);
+    assert.equal(T.parseSections(note).scope.text, 'a');
+});
+
+test('F5 resolveFindingLink prefers explicit ids over a stale frontmatter cache', () => {
+    assert.deepEqual(T.resolveFindingLink('n.md', {}, {}, { auditId: 'A', findingId: 'F' }), { auditId: 'A', findingId: 'F' });
+    assert.deepEqual(T.resolveFindingLink('n.md', { pwndoc_audit_id: 'A2', pwndoc_finding_id: 'F2' }, {}), { auditId: 'A2', findingId: 'F2' });
+    assert.equal(T.resolveFindingLink('n.md', {}, {}), null);
+    assert.equal(T.resolveFindingLink('n.md', { pwndoc_finding_id: 'F' }, {}), null);
+});
+
+test('F8 a PwnDoc title with filename-unsafe characters is not a permanent diff and is never rewritten by a push', async () => {
+    const finding = { ...FINDING, title: 'Missing header: HSTS' };
+    const info = { basename: 'VT-01 - Missing header- HSTS', fm: {} };
+    const rows = await T.buildComparison(cmpCtx, '', finding, ['title'], info);
+    assert.equal(rows[0].changed, false);
+    const ctx = syncCtx({ remote: { title: 'Missing header: HSTS' } });
+    ctx.noteInfo = info;
+    await T.pushSections(ctx, pushArgs(ctx, { sections: ['title', 'poc'] }));
+    assert.deepEqual(Object.keys(ctx.log.puts[0].body), ['poc']);
+    assert.equal(ctx.finding.title, 'Missing header: HSTS');
+});
+
+test('F9 sanitizeHtml drops script/iframe content and keeps images when pulling', () => {
+    const body = el('body', {}, el('p', {}, 'x', el('img', { src: 'ID1', alt: 'F' })), el('script', {}, 'alert(1)'), el('iframe', { src: 'http://evil' }), el('b', {}, 'bold'));
+    assert.equal(T.sanitizeHtml('ignored', () => body), '<p>x<img src="ID1" alt="F"></p><strong>bold</strong>');
+});
