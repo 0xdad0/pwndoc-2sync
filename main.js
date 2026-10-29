@@ -729,6 +729,18 @@ async function setFindingStatus(ctx, { auditId, findingId, completed, force, loc
     await saveBase(ctx.adapter, ctx.historyDir, { ts, sections: { status: completed ? 'completed' : 'in progress' } });
 }
 
+// Delete a finding from the audit. The finding is saved in the history first (the only copy once it is gone).
+async function deleteFinding(ctx, { auditId, findingId, force, localBefore = '' }) {
+    const { audit, finding } = await fetchFinding(ctx, auditId, findingId);
+    assertEditable(audit, force);
+    await recordHistory(ctx.adapter, ctx.historyDir, {
+        ts: new Date().toISOString(), op: 'delete', forced: !!force && audit.state !== 'EDIT', auditId, findingId, notePath: ctx.notePath ?? '',
+        sections: [], remoteBefore: finding, localBefore,
+    }, ctx.historyLimit);
+    await ctx.api('DELETE', `/api/audits/${auditId}/findings/${findingId}`);
+    return { title: finding.title };
+}
+
 // Frontmatter keys to write after a pull, from the codec form of the pulled fields
 function metaToFrontmatter(meta, fm = {}) {
     const out = {};
@@ -2269,10 +2281,11 @@ class LintModal extends Modal {
 
 // ── Modal: one line of text (figure caption) ──────────────────────────────────
 class PromptModal extends Modal {
-    constructor(app, title, placeholder, onSubmit) {
+    constructor(app, title, placeholder, onSubmit, okLabel = 'Insert') {
         super(app);
         this.title = title;
         this.placeholder = placeholder;
+        this.okLabel = okLabel;
         this.onSubmit = onSubmit; // (string | null) => void
         this.done = false;
     }
@@ -2283,7 +2296,7 @@ class PromptModal extends Modal {
         input.style.width = '100%';
         const submit = v => { this.done = true; this.close(); this.onSubmit(v); };
         input.addEventListener('keydown', e => { if (e.key === 'Enter' && input.value.trim()) submit(input.value.trim()); });
-        const ok = contentEl.createEl('button', { text: 'Insert', cls: 'mod-cta' });
+        const ok = contentEl.createEl('button', { text: this.okLabel, cls: 'mod-cta' });
         ok.style.marginTop = '8px';
         ok.onclick = () => { if (input.value.trim()) submit(input.value.trim()); };
         setTimeout(() => input.focus(), 0);
@@ -2518,6 +2531,7 @@ class DashboardModal extends Modal {
                 simpleList(data.missing, (l, f) => {
                     css(l.createEl('span', { text: f.title }), 'flex:1;');
                     css(l.createEl('small', { text: [`#${f.identifier ?? ''}`, f.status === STATUS_DONE ? 'completed' : 'in progress'].join(' · ') }), 'color:var(--text-muted);');
+                    if (audit) btn(l, 'Delete on PwnDoc', async () => { if (await this.plugin.deleteFindingOnPwndoc(audit._id, f._id)) l.remove(); }).addClass('mod-warning');
                 });
             }
         };
@@ -2615,6 +2629,7 @@ class PwnDocImporterPlugin extends Plugin {
         cmd('send-to-pwndoc', 'Send note to PwnDoc (select or create the finding, then push)', () => this.sendToPwndoc());
         cmd('engagement-dashboard', 'Engagement dashboard (sync status of every note)', () => this.openDashboard());
         cmd('lint-note', 'Lint this note before pushing', () => this.lintCurrentNote());
+        cmd('delete-finding', 'Delete this note\'s finding from PwnDoc', () => this.deleteNoteFindingCommand());
         cmd('unlink-note', 'Unlink note from its PwnDoc finding', () => this.unlinkNote());
         cmd('find-orphans', 'Find orphan notes (finding or engagement gone from PwnDoc)', () => this.findOrphans());
         cmd('finding-completed', 'Mark PwnDoc finding as completed', () => this.setCompleted(true));
@@ -2953,6 +2968,7 @@ class PwnDocImporterPlugin extends Plugin {
         item('Reopen finding', 'rotate-ccw', () => this.setCompleted(false));
         item('Lint this note', 'list-checks', () => this.lintCurrentNote());
         item('Unlink from finding', 'unlink', () => this.unlinkNote());
+        item('Delete finding from PwnDoc', 'trash-2', () => this.deleteNoteFindingCommand());
         menu.addSeparator();
         item('Engagement dashboard', 'layout-dashboard', () => this.openDashboard());
         item('Find orphan notes', 'search-x', () => this.findOrphans());
@@ -3313,6 +3329,44 @@ class PwnDocImporterPlugin extends Plugin {
             ...(failed.length ? ['Failed:', ...failed] : [])].join('\n');
         new Notice(`PwnDoc 2Sync: ${text}`, skipped.length || failed.length ? 15000 : 5000);
         console.log('[PwnDoc 2Sync] bulk', direction, { done, skipped, failed });
+    }
+
+    // Delete a finding from PwnDoc for everyone. Guards: audit state (Enforce), the user must type the finding title,
+    // the finding is saved in the history first. `file` (optional) is the note that points to it: it gets unlinked.
+    async deleteFindingOnPwndoc(auditId, findingId, file = null) {
+        try {
+            const probe = { api: (m, p, o) => this.api(m, p, o) };
+            const { audit, finding } = await fetchFinding(probe, auditId, findingId);
+            let force = false;
+            if (audit.state !== 'EDIT') {
+                force = await new Promise(r => new ConfirmModal(this.app, `The audit "${audit.name}" is in state ${audit.state}. Enforce: allow deleting a finding anyway?`, r).open());
+                if (!force) return false;
+            }
+            const typed = await new Promise(r => new PromptModal(this.app,
+                `Delete "${finding.title}" from "${audit.name}" on PwnDoc? This removes it for everyone. A copy is kept in the sync history.`,
+                'Type the finding title to confirm', r, 'Delete').open());
+            if (typed === null) return false;
+            if (normTitle(typed) !== normTitle(finding.title)) { new Notice('PwnDoc 2Sync: the title does not match, nothing deleted.'); return false; }
+            const ctx = {
+                ...probe, adapter: this.app.vault.adapter, historyDir: historyDir(this.manifest.dir, findingId),
+                historyLimit: this.settings.historyLimit, notePath: file?.path ?? '',
+            };
+            await deleteFinding(ctx, { auditId, findingId, force, localBefore: file ? await this.app.vault.read(file) : '' });
+            if (file) {
+                await this.app.fileManager.processFrontMatter(file, f => { delete f.pwndoc_finding_id; });
+                this.remoteWarn.delete(file.path);
+            }
+            new Notice(`PwnDoc 2Sync: finding "${finding.title}" deleted from PwnDoc.`);
+            return true;
+        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); return false; }
+    }
+
+    async deleteNoteFindingCommand() {
+        const file = this.app.workspace.getActiveFile();
+        const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
+        const link = file && resolveFindingLink(file.path, fm, this.settings.folderAudits);
+        if (!link) { new Notice('PwnDoc 2Sync: this note is not linked to a finding.'); return; }
+        await this.deleteFindingOnPwndoc(link.auditId, link.findingId, file);
     }
 
     // Remove the finding link (the engagement attribute stays). Returns true when done.
@@ -3676,7 +3730,7 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { sortDashboardRows, dashboardCounts, filterDashboardRows, bulkSummary, missingGeneralFields, reportFailureLines, GENERAL_FIELDS, DEFAULT_GENERAL_REQUIRED, setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
+module.exports.__test = { deleteFinding, sortDashboardRows, dashboardCounts, filterDashboardRows, bulkSummary, missingGeneralFields, reportFailureLines, GENERAL_FIELDS, DEFAULT_GENERAL_REQUIRED, setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
     sideBySide, missingFindings, findingToNoteRow, IMPORT_SECTIONS, folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,

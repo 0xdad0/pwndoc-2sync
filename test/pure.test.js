@@ -366,7 +366,7 @@ const AID = 'A'.repeat(24), FID = 'F'.repeat(24);
 function syncCtx({ state = 'EDIT', remote = {}, confirmEmpty = async () => true, files = {} } = {}) {
     const finding = { _id: FID, title: 'T', description: '<p>remote desc</p>', observation: '<p>remote obs</p>', poc: '<p>remote poc</p>',
         scope: 'a1', remediation: '<p>rem</p>', references: ['http://x'], cvssv3: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H', customFields: [], ...remote };
-    const log = { puts: [], posts: [] };
+    const log = { puts: [], posts: [], deletes: [] };
     const hist = memAdapter();
     const ctx = {
         log, hist, finding,
@@ -374,6 +374,7 @@ function syncCtx({ state = 'EDIT', remote = {}, confirmEmpty = async () => true,
         api: async (method, path, opts) => {
             if (method === 'GET' && path === `/api/audits/${AID}`) return { _id: AID, state, findings: [finding] };
             if (method === 'PUT') { log.puts.push({ path, body: opts.body }); Object.assign(finding, opts.body); return 'ok'; }
+            if (method === 'DELETE') { log.deletes.push(path); return 'ok'; }
             if (method === 'POST') { log.posts.push(opts.body.name); return { _id: 'b'.repeat(23) + log.posts.length }; }
             if (method === 'GET' && path.startsWith('/api/images/')) return { value: 'data:image/png;base64,' + Buffer.from('PNG').toString('base64') };
             throw new Error(`unexpected ${method} ${path}`);
@@ -1250,4 +1251,30 @@ test('bulkSummary tells how many notes and sections a bulk push or pull would wr
     assert.deepEqual(T.bulkSummary(sel, 'push', ['poc', 'scope']), { notes: 2, sections: 2, skipped: 2 });
     assert.deepEqual(T.bulkSummary(sel, 'pull', ['poc']), { notes: 1, sections: 1, skipped: 2 });
     assert.deepEqual(T.bulkSummary([], 'push', ['poc']), { notes: 0, sections: 0, skipped: 0 });
+});
+
+// ── delete a finding ──────────────────────────────────────────────────────────
+test('deleteFinding snapshots the finding in the history, then deletes exactly that finding', async () => {
+    const ctx = syncCtx();
+    const r = await T.deleteFinding(ctx, { auditId: AID, findingId: FID, force: false, localBefore: '# note' });
+    assert.deepEqual(ctx.log.deletes, [`/api/audits/${AID}/findings/${FID}`]);
+    assert.equal(r.title, 'T');
+    const h = await T.listHistory(ctx.hist, ctx.historyDir);
+    assert.equal(h.length, 1);
+    assert.equal(h[0].op, 'delete');
+    assert.equal(h[0].remoteBefore.poc, '<p>remote poc</p>');
+    assert.equal(h[0].localBefore, '# note');
+});
+
+test('deleteFinding is blocked on a non-EDIT audit unless enforced, and does nothing for a missing finding', async () => {
+    const locked = syncCtx({ state: 'APPROVED' });
+    await assert.rejects(T.deleteFinding(locked, { auditId: AID, findingId: FID, force: false }), /not EDIT/);
+    assert.deepEqual(locked.log.deletes, []);
+    assert.equal((await T.listHistory(locked.hist, locked.historyDir)).length, 0);
+    await T.deleteFinding(locked, { auditId: AID, findingId: FID, force: true });
+    assert.equal(locked.log.deletes.length, 1);
+    assert.equal((await T.listHistory(locked.hist, locked.historyDir))[0].forced, true);
+    const ctx = syncCtx();
+    await assert.rejects(T.deleteFinding(ctx, { auditId: AID, findingId: 'nope', force: false }), /finding not found/);
+    assert.deepEqual(ctx.log.deletes, []);
 });

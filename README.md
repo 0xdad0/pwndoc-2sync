@@ -219,6 +219,17 @@ When a linked note is opened (and every *Check interval* minutes for the open no
 - **Find orphan notes** checks every linked note of the vault against PwnDoc.
 - **Mark PwnDoc finding as completed** / **Reopen PwnDoc finding** change `status` on PwnDoc (state guard and history apply) and mirror it in the note frontmatter.
 
+### Delete a finding from PwnDoc
+
+**Delete this note's finding from PwnDoc** (command or status-bar menu) and the **Delete on PwnDoc** button in the dashboard tab *Only on PwnDoc* remove a finding from the engagement **for everyone**. It is the only operation that destroys data on PwnDoc, so:
+
+- The audit must be in state `EDIT`; otherwise you are asked to **Enforce** first.
+- You must **type the finding title** to confirm; any other text cancels.
+- The finding as it was (all fields) is saved in the sync history before the call, so its content can be recovered by hand; images stay on the server.
+- When started from a note, the note stays and is **unlinked** from the deleted finding.
+
+There is no bulk delete.
+
 ### Report template and report
 
 The report template is a property of the **engagement** on PwnDoc, and the report is always rendered from it.
