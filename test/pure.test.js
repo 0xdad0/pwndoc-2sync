@@ -99,3 +99,40 @@ test('replaceSection appends the section when missing', () => {
     assert.equal(T.parseSections(out).description.text, 'd');
     assert.match(out, /## Evidenza/);
 });
+
+// ── converters ────────────────────────────────────────────────────────────────
+const txt = s => ({ nodeType: 3, textContent: s });
+const el = (tag, attrs = {}, ...kids) => ({
+    nodeType: 1, tagName: tag.toUpperCase(), childNodes: kids.map(k => typeof k === 'string' ? txt(k) : k),
+    getAttribute: n => (n in attrs ? attrs[n] : null),
+    get textContent() { return this.childNodes.map(c => c.textContent).join(''); },
+});
+
+test('serializeWhitelist keeps allowed tags, drops script content, unwraps unknown tags, escapes text', () => {
+    const root = el('div', {},
+        el('p', {}, 'a < b ', el('strong', {}, 'bold'), el('script', {}, 'alert(1)'), el('custom', {}, 'kept')));
+    assert.equal(T.serializeWhitelist(root), '<p>a &lt; b <strong>bold</strong>kept</p>');
+});
+
+test('serializeWhitelist passes images through the resolver and drops unresolved ones', () => {
+    const img = el('img', { src: 'app://local/a.png', alt: 'Fig "1"' });
+    assert.equal(T.serializeWhitelist(el('p', {}, img), () => 'ID1'), '<p><img src="ID1" alt="Fig &quot;1&quot;"></p>');
+    assert.equal(T.serializeWhitelist(el('p', {}, img)), '<p></p>');
+});
+
+test('serializeWhitelist flattens highlighted code blocks to pre/code text without the copy button', () => {
+    const pre = el('pre', {}, el('button', {}, 'Copy'), el('code', {}, el('span', {}, 'GET /'), '\nHost: x'));
+    assert.equal(T.serializeWhitelist(el('div', {}, pre)), '<pre><code>GET /\nHost: x</code></pre>');
+});
+
+test('serializeWhitelist drops javascript: hrefs but keeps the link text', () => {
+    const a = el('a', { href: 'javascript:alert(1)' }, 'click');
+    const ok = el('a', { href: 'https://x.io/?a=1&b=2' }, 'ok');
+    assert.equal(T.serializeWhitelist(el('p', {}, a, ok)), '<p>click<a href="https://x.io/?a=1&amp;b=2">ok</a></p>');
+});
+
+test('image tokens round-trip id and alt, even with markdown-special characters', () => {
+    const tok = T.imgToken('6ae342352f6b9b3e849af420', 'Figura 1 – *x* _y_');
+    assert.match(tok, /^[^*_\s]+$/);
+    assert.equal(T.expandImgTokens(`<p>${tok}</p>`), '<p><img src="6ae342352f6b9b3e849af420" alt="Figura 1 – *x* _y_"></p>');
+});

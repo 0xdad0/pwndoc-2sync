@@ -1,6 +1,6 @@
 'use strict';
 
-const { Plugin, PluginSettingTab, Setting, FuzzySuggestModal, SuggestModal, Modal, Notice, normalizePath, SecretComponent } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, FuzzySuggestModal, SuggestModal, Modal, Notice, normalizePath, SecretComponent, Component, MarkdownRenderer, htmlToMarkdown } = require('obsidian');
 
 // ── CSV Parser ────────────────────────────────────────────────────────────────
 function parseCSV(text) {
@@ -39,22 +39,6 @@ function parseCSV(text) {
         headers.forEach((h, idx) => { row[h] = fields[idx] ?? ''; });
         return row;
     });
-}
-
-// ── HTML → plain text ─────────────────────────────────────────────────────────
-function stripHtml(html) {
-    if (!html) return '';
-    return html
-        .replace(/<br\s*\/?>/gi, '\n')
-        .replace(/<\/?(p|div|li|h[1-6])[^>]*>/gi, '\n')
-        .replace(/<ul[^>]*>|<\/ul>/gi, '\n')
-        .replace(/<ol[^>]*>|<\/ol>/gi, '\n')
-        .replace(/<[^>]+>/g, '')
-        .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
-        .replace(/&nbsp;/g, ' ').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
-        .replace(/</g, '\\<')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim();
 }
 
 // ── CVSS 3.1 score calculator ─────────────────────────────────────────────────
@@ -153,6 +137,64 @@ function replaceSection(md, key, newText) {
     const atEof = sec.end >= md.length;
     return md.slice(0, sec.start) + '\n' + (body ? body + '\n' : '') + (atEof ? '' : '\n') + md.slice(sec.end);
 }
+
+// ── Converters (HTML <-> Markdown) ────────────────────────────────────────────
+const ALLOWED_TAGS = new Set(['p', 'ul', 'ol', 'li', 'strong', 'em', 'code', 'pre', 'a', 'br', 'blockquote',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'table', 'thead', 'tbody', 'tr', 'th', 'td']);
+const DROP_TAGS = new Set(['script', 'style', 'button', 'iframe', 'object', 'embed']);
+
+const escHtml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const escAttr = s => escHtml(s).replace(/"/g, '&quot;');
+
+// Serialise a rendered DOM subtree into the HTML subset PwnDoc's editor stores.
+// imgResolver(src, alt) returns the value for <img src>, or null to drop the image.
+function serializeWhitelist(node, imgResolver = () => null) {
+    if (node.nodeType === 3) return escHtml(node.textContent);
+    if (node.nodeType !== 1) return '';
+    const tag = node.tagName.toLowerCase();
+    if (DROP_TAGS.has(tag)) return '';
+    if (tag === 'pre') return `<pre><code>${escHtml(textWithoutDropped(node))}</code></pre>`;
+    if (tag === 'img') {
+        const src = imgResolver(node.getAttribute('src') || '', node.getAttribute('alt') || '');
+        return src ? `<img src="${escAttr(src)}" alt="${escAttr(node.getAttribute('alt') || '')}">` : '';
+    }
+    const inner = Array.from(node.childNodes).map(c => serializeWhitelist(c, imgResolver)).join('');
+    if (tag === 'br') return '<br>';
+    if (!ALLOWED_TAGS.has(tag)) return inner;
+    if (tag === 'a') {
+        const href = node.getAttribute('href') || '';
+        return /^(https?:|mailto:)/i.test(href) ? `<a href="${escAttr(href)}">${inner}</a>` : inner;
+    }
+    return `<${tag}>${inner}</${tag}>`;
+}
+
+function textWithoutDropped(node) {
+    if (node.nodeType === 3) return node.textContent;
+    if (node.nodeType !== 1 || DROP_TAGS.has(node.tagName.toLowerCase())) return '';
+    return Array.from(node.childNodes).map(textWithoutDropped).join('');
+}
+
+// Image refs are swapped for inert tokens before rendering and expanded after serialising,
+// so the renderer never sees (or rewrites) vault paths. Alt is hex encoded: no markdown-special chars.
+const IMG_TOKEN_RE = /⟦pwimg:([0-9a-f]+):([0-9a-f]*)⟧/g;
+const imgToken = (id, alt) => `⟦pwimg:${id}:${Buffer.from(alt, 'utf8').toString('hex')}⟧`;
+const expandImgTokens = html => html.replace(IMG_TOKEN_RE, (_, id, hex) =>
+    `<img src="${id}" alt="${escAttr(Buffer.from(hex, 'hex').toString('utf8'))}">`);
+
+// Runtime-only (needs Obsidian): markdown -> PwnDoc HTML
+async function mdToHtml(app, md) {
+    const div = document.createElement('div');
+    const comp = new Component();
+    comp.load();
+    try { await MarkdownRenderer.render(app, md, div, '', comp); }
+    finally { comp.unload(); }
+    return expandImgTokens(serializeWhitelist(div));
+}
+
+const htmlToMd = html => (html ? htmlToMarkdown(html).trim() : '');
+
+// Comparison form: both sides pass through the same renderer so formatting noise cancels out
+async function normalizeMd(app, md) { return htmlToMd(await mdToHtml(app, md)); }
 
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
 async function readFilePath(app, filePath) {
@@ -1040,14 +1082,14 @@ class PwnDocImporterPlugin extends Plugin {
             .filter(k => !STANDARD_FIELDS.has(k) && !reservedKeys.has(k))
             .map(k => ({
                 label: k,
-                value: stripHtml(vuln[k] || '').trim(),
+                value: htmlToMd(vuln[k] || ''),
             }))
             .filter(({ value }) => value !== '');
 
         // Content sections (HTML stripped)
-        const description  = stripHtml(vuln.description);
-        const observation  = stripHtml(vuln.observation);
-        const remediation  = stripHtml(vuln.remediation);
+        const description  = htmlToMd(vuln.description);
+        const observation  = htmlToMd(vuln.observation);
+        const remediation  = htmlToMd(vuln.remediation);
         const references   = vuln.references || '';
 
         const title    = (vuln.title || 'Untitled').replace(/[\\/:*?"<>|]/g, '-');
@@ -1136,4 +1178,4 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection };
+module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens };
