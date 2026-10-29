@@ -297,3 +297,66 @@ test('buildComparison: a missing PoC on PwnDoc (remote empty) is flagged', async
     assert.equal(rows[0].remoteEmpty, true);
     assert.equal(rows[0].changed, true);
 });
+
+// ── history store ─────────────────────────────────────────────────────────────
+function memAdapter() {
+    const files = new Map();
+    return {
+        files,
+        exists: async p => files.has(p) || [...files.keys()].some(k => k.startsWith(p + '/')),
+        mkdir: async () => {},
+        write: async (p, d) => { files.set(p, d); },
+        read: async p => { if (!files.has(p)) throw new Error('ENOENT ' + p); return files.get(p); },
+        remove: async p => { files.delete(p); },
+        list: async dir => ({ files: [...files.keys()].filter(k => k.startsWith(dir + '/') && !k.slice(dir.length + 1).includes('/')), folders: [] }),
+    };
+}
+const entry = (ts, op = 'push') => ({ ts, op, forced: false, auditId: 'A', findingId: 'F', notePath: 'n.md', sections: ['poc'], remoteBefore: { poc: '<p>x</p>' }, localBefore: '# n' });
+
+test('historyDir nests under the plugin dir per finding', () => {
+    assert.equal(T.historyDir('.obsidian/plugins/pwndoc-importer', 'F1'), '.obsidian/plugins/pwndoc-importer/history/F1');
+});
+
+test('recordHistory then listHistory returns the entry, newest first', async () => {
+    const ad = memAdapter();
+    const dir = T.historyDir('p', 'F');
+    await T.recordHistory(ad, dir, entry('2026-10-29T10:00:00.000Z'), 50);
+    await T.recordHistory(ad, dir, entry('2026-10-29T11:00:00.000Z', 'pull'), 50);
+    const list = await T.listHistory(ad, dir);
+    assert.deepEqual(list.map(e => e.op), ['pull', 'push']);
+    assert.equal(list[1].localBefore, '# n');
+});
+
+test('recordHistory keeps only the newest `limit` entries and never prunes base.json', async () => {
+    const ad = memAdapter();
+    const dir = T.historyDir('p', 'F');
+    await T.saveBase(ad, dir, { ts: 't', sections: { poc: 'x' } });
+    for (const h of ['01', '02', '03']) await T.recordHistory(ad, dir, entry(`2026-10-29T${h}:00:00.000Z`), 2);
+    const list = await T.listHistory(ad, dir);
+    assert.deepEqual(list.map(e => e.ts), ['2026-10-29T03:00:00.000Z', '2026-10-29T02:00:00.000Z']);
+    assert.notEqual(await T.loadBase(ad, dir), null);
+});
+
+test('listHistory skips corrupt files', async () => {
+    const ad = memAdapter();
+    const dir = T.historyDir('p', 'F');
+    await T.recordHistory(ad, dir, entry('2026-10-29T10:00:00.000Z'), 50);
+    await ad.write(`${dir}/2026-10-29T12-00-00-000Z-push-zzzz.json`, '{not json');
+    assert.equal((await T.listHistory(ad, dir)).length, 1);
+});
+
+test('pruneNames returns the oldest names beyond the limit', () => {
+    assert.deepEqual(T.pruneNames(['a', 'b', 'c'], 2), ['a']);
+    assert.deepEqual(T.pruneNames(['a'], 2), []);
+});
+
+test('loadBase is null without a file; saveBase merges sections across calls', async () => {
+    const ad = memAdapter();
+    const dir = T.historyDir('p', 'F');
+    assert.equal(await T.loadBase(ad, dir), null);
+    await T.saveBase(ad, dir, { ts: '1', sections: { poc: 'p1' } });
+    await T.saveBase(ad, dir, { ts: '2', sections: { description: 'd1' } });
+    const b = await T.loadBase(ad, dir);
+    assert.deepEqual(b.sections, { poc: 'p1', description: 'd1' });
+    assert.equal(b.ts, '2');
+});

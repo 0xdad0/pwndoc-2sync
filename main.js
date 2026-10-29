@@ -391,6 +391,44 @@ async function buildComparison(ctx, noteMd, finding, keys) {
     return rows;
 }
 
+// ── History store ─────────────────────────────────────────────────────────────
+// One JSON per operation under <plugin dir>/history/<findingId>/, plus base.json (last synced state per section).
+// adapter = app.vault.adapter. The directory holds client data: it is git-ignored.
+const BASE_FILE = 'base.json';
+const historyDir = (manifestDir, findingId) => `${manifestDir}/history/${findingId}`;
+const historyFiles = async (adapter, dir) =>
+    (await adapter.exists(dir) ? (await adapter.list(dir)).files : [])
+        .filter(f => f.endsWith('.json') && !f.endsWith(`/${BASE_FILE}`));
+
+// Names (oldest first) to delete so that `limit` newest remain
+const pruneNames = (names, limit) => [...names].sort().slice(0, Math.max(0, names.length - limit));
+
+async function recordHistory(adapter, dir, entry, limit) {
+    if (!(await adapter.exists(dir))) await adapter.mkdir(dir);
+    const id = `${entry.ts.replace(/[:.]/g, '-')}-${entry.op}-${Math.random().toString(16).slice(2, 6)}`;
+    await adapter.write(`${dir}/${id}.json`, JSON.stringify({ ...entry, id }, null, 1));
+    for (const f of pruneNames(await historyFiles(adapter, dir), limit)) await adapter.remove(f);
+}
+
+// Newest first; unreadable files are skipped
+async function listHistory(adapter, dir) {
+    const out = [];
+    for (const f of (await historyFiles(adapter, dir)).sort().reverse()) {
+        try { out.push(JSON.parse(await adapter.read(f))); } catch { /* corrupt entry, skip */ }
+    }
+    return out;
+}
+
+async function loadBase(adapter, dir) {
+    try { return JSON.parse(await adapter.read(`${dir}/${BASE_FILE}`)); } catch { return null; }
+}
+
+async function saveBase(adapter, dir, base) {
+    const prev = await loadBase(adapter, dir);
+    if (!(await adapter.exists(dir))) await adapter.mkdir(dir);
+    await adapter.write(`${dir}/${BASE_FILE}`, JSON.stringify({ ts: base.ts, sections: { ...prev?.sections, ...base.sections } }, null, 1));
+}
+
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
 async function readFilePath(app, filePath) {
     if (/^([A-Za-z]:[\\/]|\/)/.test(filePath)) {
@@ -561,6 +599,9 @@ const DEFAULT_SETTINGS = {
     debugMode:       false,
     templates:       [], // [{ label: string, path: string, position: 'top'|'bottom' }]
     folderAudits:    {}, // { [vault folder path]: { auditId, name } }
+    historyLimit:    50, // history entries kept per finding
+    imageCache:      {}, // { [auditId]: { [sha256]: pwndoc image id } }
+    attachmentsFolder: 'attachments', // where pulled images are saved (vault path)
 };
 
 // ── Modal: fuzzy search over vuln list ────────────────────────────────────────
@@ -1505,4 +1546,5 @@ class PwnDocImporterPlugin extends Plugin {
 module.exports = PwnDocImporterPlugin;
 module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
-    lineDiff, buildComparison, renderCustomFields };
+    lineDiff, buildComparison, renderCustomFields,
+    historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase };
