@@ -841,6 +841,38 @@ function engagementStatus(fm, entry) {
     return { text: `PwnDoc: ${name}${linked ? '' : ' · no finding'}`, linked };
 }
 
+// ── Side-by-side view and import of findings that exist only on PwnDoc ────────
+// diff = lineDiff(pwndocText, noteText). Rows for two aligned columns: left PwnDoc, right note, null = no counterpart
+function sideBySide(diff) {
+    const rows = [];
+    let dels = [], adds = [];
+    const flush = () => {
+        for (let i = 0; i < Math.max(dels.length, adds.length); i++) {
+            const left = dels[i] ?? null, right = adds[i] ?? null;
+            rows.push({ left, right, kind: left !== null && right !== null ? 'mod' : left !== null ? 'del' : 'add' });
+        }
+        dels = []; adds = [];
+    };
+    for (const d of diff) {
+        if (d.op === 'eq') { flush(); rows.push({ left: d.line, right: d.line, kind: 'eq' }); }
+        else if (d.op === 'del') dels.push(d.line);
+        else adds.push(d.line);
+    }
+    flush();
+    return rows;
+}
+
+// Findings of the audit that no note points to yet, in audit order
+const missingFindings = (audit, linkedFindingIds) => (audit.findings || []).filter(f => !linkedFindingIds.has(f._id));
+
+// What createVulnNote needs for a note born from a finding; the body sections are pulled right after
+const findingToNoteRow = (finding, audit) => ({
+    id: '', title: finding.title, category: finding.vulnType, cvssv3: finding.cvssv3 || '', locale: audit.language,
+    description: '', observation: '', remediation: '', references: '',
+});
+
+const IMPORT_SECTIONS = ['description', 'observation', 'poc', 'scope', 'remediation', 'references'];
+
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
 async function readFilePath(app, filePath) {
     if (/^([A-Za-z]:[\\/]|\/)/.test(filePath)) {
@@ -1583,8 +1615,9 @@ class ConfirmModal extends Modal {
     onClose() { this.contentEl.empty(); if (!this.answered) this.onAnswer(false); }
 }
 
-// ── Modal: per-section compare and merge (push / pull / three-way merge) ──────
+// ── Modal: per-section compare, PwnDoc and note side by side ──────────────────
 // rows: buildComparison() rows. onApply({ push: key[], pull: key[], merge: { [key]: text }, force })
+// Per section the user picks: skip, use the PwnDoc version (pull), use the note version (push) or merge both
 class MergeModal extends Modal {
     constructor(app, rows, { defaultKeys, auditState, onApply }) {
         super(app);
@@ -1597,6 +1630,7 @@ class MergeModal extends Modal {
     onOpen() {
         const { contentEl } = this;
         contentEl.empty();
+        this.modalEl.style.width = 'min(1100px, 95vw)';
         contentEl.createEl('h3', { text: 'Compare with PwnDoc' });
 
         let forceBox = null;
@@ -1610,72 +1644,99 @@ class MergeModal extends Modal {
         }
 
         const STATUS = { same: 'identical', local: 'changed in the note', remote: 'changed on PwnDoc', conflict: 'changed on both sides', unknown: 'differs (no sync base)' };
+        const TINT = { del: 'var(--background-modifier-error)', add: 'var(--background-modifier-success)', none: 'var(--background-secondary)' };
+
         const ui = this.rows.map(row => {
             const def = SECTION_DEFS.find(d => d.key === row.key);
+            const locked = !!def.readOnly || !row.changed;
+            let value = locked ? 'skip'
+                : !this.defaultKeys.includes(row.key) ? 'skip'
+                : row.merge ? 'merge' : row.status === 'remote' ? 'pwndoc' : 'note';
+
             const box = contentEl.createEl('div');
-            box.style.cssText = 'margin-bottom:8px;';
-            const head = box.createEl('label');
-            const check = head.createEl('input', { type: 'checkbox' });
-            check.checked = !def.readOnly && row.changed && this.defaultKeys.includes(row.key);
-            check.disabled = !!def.readOnly || !row.changed;
-            head.createEl('strong', { text: ` ${labelOf(def)} ` });
+            box.style.cssText = 'margin-bottom:12px;padding:6px 8px;border:1px solid var(--background-modifier-border);border-radius:6px;';
+            const head = box.createEl('div');
+            head.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:10px;';
+            head.createEl('strong', { text: labelOf(def) });
             head.createEl('small', {
                 text: [def.readOnly && row.changed ? 'read-only' : STATUS[row.status],
                     row.localEmpty ? 'note empty' : '', row.remoteEmpty ? 'PwnDoc empty' : ''].filter(Boolean).join(' · '),
                 cls: 'pwndoc-meta',
             });
-            const dir = head.createEl('select');
-            dir.style.marginLeft = '8px';
-            dir.createEl('option', { value: 'push', text: 'note → PwnDoc' });
-            dir.createEl('option', { value: 'pull', text: 'PwnDoc → note' });
-            if (row.merge) dir.createEl('option', { value: 'merge', text: 'merge both' });
-            dir.value = row.merge ? 'merge' : row.status === 'remote' ? 'pull' : 'push';
 
-            let area = null;
+            const group = head.createEl('div');
+            group.style.cssText = 'margin-left:auto;display:flex;gap:4px;';
+            const choices = [['skip', 'Skip'], ['pwndoc', 'Use PwnDoc'], ['note', 'Use note'], ...(row.merge ? [['merge', 'Merge both']] : [])];
+            const btns = {};
+            let area = null, headL = null, headR = null;
+            const set = v => {
+                value = v;
+                for (const [k, b] of Object.entries(btns)) b.toggleClass('mod-cta', k === v);
+                if (area) area.style.display = v === 'merge' ? '' : 'none';
+                if (headL) headL.style.outline = v === 'pwndoc' ? '2px solid var(--interactive-accent)' : '';
+                if (headR) headR.style.outline = v === 'note' ? '2px solid var(--interactive-accent)' : '';
+            };
+            for (const [k, label] of choices) {
+                const b = group.createEl('button', { text: label });
+                b.disabled = locked && k !== 'skip';
+                b.onclick = () => set(k);
+                btns[k] = b;
+            }
+
             if (row.changed) {
-                const det = box.createEl('details');
-                det.createEl('summary', { text: 'diff (PwnDoc → note)' });
-                const pre = det.createEl('pre');
-                pre.style.cssText = 'max-height:200px;overflow:auto;font-size:0.8em;';
-                for (const d of row.diff) {
-                    const l = pre.createEl('div', { text: `${{ eq: '  ', add: '+ ', del: '- ' }[d.op]}${d.line}` });
-                    if (d.op === 'add') l.style.color = 'var(--text-success)';
-                    if (d.op === 'del') l.style.color = 'var(--text-error)';
+                const grid = box.createEl('div');
+                grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:0 8px;margin-top:6px;max-height:280px;overflow:auto;font-family:var(--font-monospace);font-size:0.8em;';
+                const colHead = (text, pick) => {
+                    const h = grid.createEl('div', { text });
+                    h.style.cssText = 'position:sticky;top:0;z-index:1;font-weight:bold;padding:2px 4px;background:var(--background-primary);' + (locked ? '' : 'cursor:pointer;');
+                    if (!locked) h.onclick = () => set(pick);
+                    return h;
+                };
+                headL = colHead('PwnDoc', 'pwndoc');
+                headR = colHead('Note', 'note');
+                for (const r of sideBySide(row.diff)) {
+                    for (const [text, side] of [[r.left, 'left'], [r.right, 'right']]) {
+                        const c = grid.createEl('div');
+                        c.style.cssText = 'white-space:pre-wrap;word-break:break-word;padding:0 4px;min-height:1.2em;';
+                        c.setText(text ?? '');
+                        if (text === null) c.style.background = TINT.none;
+                        else if (r.kind === 'mod') c.style.background = side === 'left' ? TINT.del : TINT.add;
+                        else if (r.kind === 'del' || r.kind === 'add') c.style.background = r.kind === 'del' ? TINT.del : TINT.add;
+                    }
                 }
             }
             if (row.merge) {
                 area = box.createEl('textarea');
                 area.value = row.merge.text;
                 area.rows = 8;
-                area.style.cssText = 'width:100%;font-family:var(--font-monospace);font-size:0.8em;';
+                area.style.cssText = 'width:100%;margin-top:6px;font-family:var(--font-monospace);font-size:0.8em;';
                 box.createEl('small', {
                     text: row.merge.conflicts ? `${row.merge.conflicts} conflict(s): resolve the markers (<<<<<<< / ======= / >>>>>>>) before applying` : 'merged without conflicts, review before applying',
                     cls: 'pwndoc-meta',
                 });
-                const sync = () => { area.style.display = dir.value === 'merge' ? '' : 'none'; };
-                dir.onchange = sync;
-                sync();
             }
-            return { row, check, dir, area };
+            set(value);
+            return { row, locked, value: () => value, set, area };
         });
 
         const bar = contentEl.createEl('div');
         bar.style.cssText = 'display:flex;gap:8px;margin-top:10px;';
-        const setAll = v => ui.forEach(u => { if (!u.check.disabled) u.check.checked = v; });
-        bar.createEl('button', { text: 'All' }).onclick = () => setAll(true);
-        bar.createEl('button', { text: 'None' }).onclick = () => setAll(false);
+        const setAll = v => ui.forEach(u => { if (!u.locked) u.set(v); });
+        bar.createEl('button', { text: 'All: PwnDoc' }).onclick = () => setAll('pwndoc');
+        bar.createEl('button', { text: 'All: note' }).onclick = () => setAll('note');
+        bar.createEl('button', { text: 'None' }).onclick = () => setAll('skip');
         const apply = bar.createEl('button', { text: 'Apply', cls: 'mod-cta' });
         apply.style.marginLeft = 'auto';
         apply.onclick = () => {
-            const picked = ui.filter(u => u.check.checked);
-            const push = picked.filter(u => u.dir.value === 'push').map(u => u.row.key);
-            const pull = picked.filter(u => u.dir.value === 'pull').map(u => u.row.key);
-            const merge = Object.fromEntries(picked.filter(u => u.dir.value === 'merge').map(u => [u.row.key, u.area.value]));
+            const keysOf = v => ui.filter(u => u.value() === v).map(u => u.row.key);
+            const push = keysOf('note');
+            const pull = keysOf('pwndoc');
+            const merge = Object.fromEntries(ui.filter(u => u.value() === 'merge').map(u => [u.row.key, u.area.value]));
             if (!push.length && !pull.length && !Object.keys(merge).length) { new Notice('PwnDoc Importer: nothing selected.'); return; }
             const bad = Object.entries(merge).find(([, t]) => hasConflictMarkers(t));
             if (bad) { new Notice(`PwnDoc Importer: resolve the conflict markers in "${labelOf(defOf(bad[0]))}" first.`); return; }
             if ((push.length || Object.keys(merge).length) && this.auditState !== 'EDIT' && !forceBox?.checked) {
-                new Notice(`PwnDoc Importer: audit is ${this.auditState}, tick "Enforce" to push.`);
+                new Notice(`PwnDoc Importer: audit is ${this.auditState}, tick "Enforce" to write to PwnDoc.`);
                 return;
             }
             this.close();
@@ -1684,6 +1745,29 @@ class MergeModal extends Modal {
     }
 
     onClose() { this.contentEl.empty(); }
+}
+
+// ── Modal: findings on PwnDoc that have no note yet ───────────────────────────
+class MissingFindingsModal extends SuggestModal {
+    constructor(app, findings, onChoose) {
+        super(app);
+        this.findings = findings;
+        this.onChoose = onChoose; // (finding[] | null) => void
+        this.chosen = false;
+        this.setPlaceholder('Findings on PwnDoc without a note...');
+    }
+    getSuggestions(q) {
+        const query = q.toLowerCase();
+        const items = this.findings.filter(f => `${f.identifier} ${f.title}`.toLowerCase().includes(query)).map(f => ({ f }));
+        return query ? items : [{ all: true }, ...items];
+    }
+    renderSuggestion(i, el) {
+        if (i.all) { el.createEl('div', { text: `Import all ${this.findings.length} findings` }); return; }
+        el.createEl('div', { text: i.f.title });
+        el.createEl('small', { text: [`#${i.f.identifier}`, i.f.vulnType, i.f.cvssv3].filter(Boolean).join(' · '), cls: 'pwndoc-meta' });
+    }
+    onChooseSuggestion(i) { this.chosen = true; this.onChoose(i.all ? this.findings : [i.f]); }
+    onClose() { super.onClose(); setTimeout(() => { if (!this.chosen) this.onChoose(null); }, 0); }
 }
 
 // ── Modal: pick a history entry, then where to restore it ─────────────────────
@@ -1852,6 +1936,11 @@ class PwnDocImporterPlugin extends Plugin {
         this.statusEl.addClass('mod-clickable');
         this.statusEl.onclick = e => this.openQuickMenu(e);
         this.addCommand({
+            id: 'import-findings-from-pwndoc',
+            name: 'Import findings that exist only on PwnDoc',
+            callback: () => this.importFindingsFromPwndoc(),
+        });
+        this.addCommand({
             id: 'refresh-engagement-attributes',
             name: 'Refresh engagement attribute on notes',
             callback: () => this.refreshEngagementAttributes(),
@@ -1864,6 +1953,8 @@ class PwnDocImporterPlugin extends Plugin {
             if (file.children === undefined) return;
             menu.addItem(i => i.setTitle('Associate to PwnDoc engagement').setIcon('shield-plus')
                 .onClick(() => this.associateFolder(file.path === '/' ? '' : file.path)));
+            menu.addItem(i => i.setTitle('Import findings from PwnDoc here').setIcon('download')
+                .onClick(() => this.importFindingsFromPwndoc(file.path === '/' ? '' : file.path)));
         }));
         this.app.workspace.onLayoutReady(() => {
             refresh();
@@ -2167,6 +2258,7 @@ class PwnDocImporterPlugin extends Plugin {
         item('Compare with PwnDoc and merge', 'git-compare', () => this.compareWithPwndoc());
         item('Associate note to finding', 'link', () => this.associateNote());
         item('Create PwnDoc finding for this note', 'plus-circle', () => this.createFindingForNote());
+        item('Import findings that exist only on PwnDoc', 'download', () => this.importFindingsFromPwndoc());
         item('Sync history (rollback)', 'history', () => this.rollbackFromHistory());
         menu.addSeparator();
         item('Associate folder to engagement', 'folder-plus', () => this.associateFolder());
@@ -2373,6 +2465,42 @@ class PwnDocImporterPlugin extends Plugin {
         } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
     }
 
+    // Findings that exist on PwnDoc but have no note in the vault: create the notes from them (download only)
+    async importFindingsFromPwndoc(folderArg) {
+        const active = this.app.workspace.getActiveFile();
+        try {
+            let auditId = folderArg !== undefined
+                ? folderAuditFor(`${folderArg ? folderArg + '/' : ''}x.md`, this.settings.folderAudits)?.auditId
+                : active ? resolveAuditId(active.path, this.app.metadataCache.getFileCache(active)?.frontmatter, this.settings.folderAudits) : null;
+            if (!auditId) auditId = (await this.pickAudit())?._id;
+            if (!auditId) return;
+
+            const audit = await this.api('GET', `/api/audits/${auditId}`);
+            const linked = new Set(this.app.vault.getMarkdownFiles()
+                .map(f => this.app.metadataCache.getFileCache(f)?.frontmatter?.pwndoc_finding_id).filter(Boolean));
+            const missing = missingFindings(audit, linked);
+            if (!missing.length) { new Notice(`PwnDoc Importer: every finding of "${audit.name}" already has a note.`); return; }
+
+            const picked = await new Promise(resolve => new MissingFindingsModal(this.app, missing, resolve).open());
+            if (!picked?.length) return;
+            const prefix = await new Promise(resolve => new PrefixModal(this.app, resolve).open());
+            const folder = folderArg ?? await new Promise(resolve =>
+                new FolderModal(this.app, active?.parent?.path === '/' ? '' : (active?.parent?.path ?? ''), resolve).open());
+
+            let n = 0;
+            for (const finding of picked) {
+                const file = await this.createVulnNote(findingToNoteRow(finding, audit), prefix, folder,
+                    { findingId: finding._id, audit, open: picked.length === 1 });
+                if (!file) continue;
+                const ctx = this.syncCtx(file, finding._id, auditId);
+                const r = await pullSections(ctx, { auditId, findingId: finding._id, noteMd: await this.app.vault.read(file), sections: IMPORT_SECTIONS });
+                await this.app.vault.modify(file, r.noteMd);
+                n++;
+            }
+            new Notice(`PwnDoc Importer: imported ${n} finding(s) from "${audit.name}".`);
+        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+    }
+
     // Step 2 — ask VT or M
     askPrefix(vuln) {
         new PrefixModal(this.app, prefix => this.askFolder(vuln, prefix)).open();
@@ -2386,7 +2514,7 @@ class PwnDocImporterPlugin extends Plugin {
     }
 
     // Step 4 — create the note
-    async createVulnNote(vuln, prefix, folder) {
+    async createVulnNote(vuln, prefix, folder, extra = {}) {
         // Next sequential number for the chosen prefix inside the target folder
         const allFiles = this.app.vault.getMarkdownFiles();
         const folderFiles = folder
@@ -2437,8 +2565,9 @@ class PwnDocImporterPlugin extends Plugin {
         const title    = (vuln.title || 'Untitled').replace(/[\\/:*?"<>|]/g, '-');
         const noteName = `${prefix}-${num} - ${title}`;
         const filePath = folder ? `${folder}/${noteName}.md` : `${noteName}.md`;
-        const auditId = resolveAuditId(filePath, {}, this.settings.folderAudits);
         const auditEntry = folderAuditFor(filePath, this.settings.folderAudits);
+        const auditId = extra.audit?._id ?? auditEntry?.auditId ?? null;
+        const auditName = extra.audit?.name ?? auditEntry?.name;
 
         // Custom fields section at the end
         const cfSection = extraCf.length > 0
@@ -2471,12 +2600,13 @@ class PwnDocImporterPlugin extends Plugin {
             `cvss_severity: ${cvssSeverity}`,
             `status: "DRAFT"`,
             `pwndoc: true`,
-            `pwndoc_id: "${vuln.id}"`,
+            ...(vuln.id ? [`pwndoc_id: "${vuln.id}"`] : []),
             `locale: "${vuln.locale}"`,
             `category: "${vuln.category}"`,
             `assets: "INSERT_ASSET"`,
             ...(auditId ? [`pwndoc_audit_id: "${auditId}"`] : []),
-            ...(auditEntry ? [`pwndoc_audit: ${JSON.stringify(auditEntry.name)}`] : []),
+            ...(auditName ? [`pwndoc_audit: ${JSON.stringify(auditName)}`] : []),
+            ...(extra.findingId ? [`pwndoc_finding_id: "${extra.findingId}"`] : []),
             '---',
         ].join('\n');
 
@@ -2514,8 +2644,9 @@ class PwnDocImporterPlugin extends Plugin {
                 await this.app.vault.createFolder(folder);
             }
             const file = await this.app.vault.create(normalizePath(filePath), content);
-            await this.app.workspace.getLeaf().openFile(file);
+            if (extra.open !== false) await this.app.workspace.getLeaf().openFile(file);
             new Notice(`Created: ${noteName}`);
+            return file;
         } catch (e) {
             new Notice(`PwnDoc Importer: failed to create note — ${e.message}`);
             console.error(e);
@@ -2527,7 +2658,7 @@ module.exports = PwnDocImporterPlugin;
 module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
-    folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,
+    sideBySide, missingFindings, findingToNoteRow, IMPORT_SECTIONS, folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,
     matchFinding, buildFindingFromLibrary, buildFindingFromNote, createFinding, classify, merge3, hasConflictMarkers, applyMerged, isValidCvss31, cvssFrontmatter, localValue, labelOf, historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase,
     AuditLockedError, assertEditable, findingHash, assertUnchanged, isEmptyValue, pushSections, pullSections,
     restoreRemotePatch, restoreLocal, buildRollbackComparison, rollbackSections };

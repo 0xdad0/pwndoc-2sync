@@ -840,3 +840,40 @@ test('engagementStatus shows the engagement name and whether the note has a find
     assert.match(T.engagementStatus({ pwndoc_audit_id: 'abcdef123456' }, null).text, /^PwnDoc: audit abcdef/);
     assert.deepEqual(T.engagementStatus({}, null), { text: '', linked: false });
 });
+
+// ── side-by-side compare and import-only-on-PwnDoc ────────────────────────────
+test('sideBySide aligns equal lines, pairs replaced lines, and leaves a blank cell for pure additions and deletions', () => {
+    const rows = T.sideBySide(T.lineDiff('a\nb\nc', 'a\nB\nc\nd'));
+    assert.deepEqual(rows, [
+        { left: 'a', right: 'a', kind: 'eq' },
+        { left: 'b', right: 'B', kind: 'mod' },
+        { left: 'c', right: 'c', kind: 'eq' },
+        { left: null, right: 'd', kind: 'add' },
+    ]);
+    assert.deepEqual(T.sideBySide(T.lineDiff('x\ny', 'x')), [{ left: 'x', right: 'x', kind: 'eq' }, { left: 'y', right: null, kind: 'del' }]);
+    assert.deepEqual(T.sideBySide([]), []);
+});
+
+test('sideBySide pairs a longer replaced block row by row', () => {
+    const rows = T.sideBySide(T.lineDiff('a\nb\nc\nz', 'a\nX\nY\nz'));
+    assert.deepEqual(rows.map(r => [r.left, r.right, r.kind]), [['a', 'a', 'eq'], ['b', 'X', 'mod'], ['c', 'Y', 'mod'], ['z', 'z', 'eq']]);
+});
+
+test('missingFindings lists the audit findings that have no note yet, in audit order', () => {
+    const audit = { findings: [{ _id: 'f1', title: 'A' }, { _id: 'f2', title: 'B' }, { _id: 'f3', title: 'C' }] };
+    assert.deepEqual(T.missingFindings(audit, new Set(['f2'])).map(f => f._id), ['f1', 'f3']);
+    assert.deepEqual(T.missingFindings(audit, new Set(['f1', 'f2', 'f3'])), []);
+    assert.deepEqual(T.missingFindings({}, new Set()), []);
+});
+
+test('findingToNoteRow builds the importer row from a finding and the audit language', () => {
+    const f = { _id: 'f1', title: 'SQLi', vulnType: 'WAPT', cvssv3: V };
+    assert.deepEqual(T.findingToNoteRow(f, { language: 'IT-it' }), {
+        id: '', title: 'SQLi', category: 'WAPT', cvssv3: V, locale: 'IT-it', description: '', observation: '', remediation: '', references: '',
+    });
+    assert.equal(T.findingToNoteRow({ ...f, cvssv3: undefined }, { language: 'EN-en' }).cvssv3, '');
+});
+
+test('importSectionKeys are the sections pulled into a freshly imported note (no title/CVSS, those are already set)', () => {
+    assert.deepEqual(T.IMPORT_SECTIONS, ['description', 'observation', 'poc', 'scope', 'remediation', 'references']);
+});

@@ -128,6 +128,10 @@ Link notes to a PwnDoc **engagement (audit)**, compare them with the matching **
 | **Associate note to PwnDoc finding** | Picks the finding of the audit (best title match first) and writes `pwndoc_audit_id` and `pwndoc_finding_id` in the frontmatter. If the audit has no finding with the note title it offers to create one. |
 | **Create PwnDoc finding for this note** | Links an existing finding with the same title, otherwise creates one from a **library vulnerability** (the one in `pwndoc_id` is suggested, any other can be picked) or a **blank** finding with the note title and CVSS. Then opens the compare with Evidenza selected. |
 
+### Import findings that exist only on PwnDoc
+
+**Import findings that exist only on PwnDoc** (command, status-bar menu, or right-click a folder → *Import findings from PwnDoc here*) lists the findings of the engagement that no note points to yet. Pick one or *Import all*, choose `VT`/`M` and the folder: each finding becomes a numbered note with description, impact, evidence (images downloaded to the attachments folder), assets, remediation and references, already linked to the finding and the engagement, with the sync base set so the next compare starts clean. This direction never writes to PwnDoc. The engagement comes from the open note or the folder you right-clicked, otherwise you are asked.
+
 ### Quick actions
 
 - **Status bar:** for a note that belongs to an engagement it shows `PwnDoc: <engagement>` (with `· no finding` until the note is linked). Click it for a menu with compare, associate note, create finding, history, associate folder and refresh.
@@ -136,7 +140,7 @@ Link notes to a PwnDoc **engagement (audit)**, compare them with the matching **
 
 ### Compare and merge
 
-**Compare with PwnDoc and merge sections** opens one row per section with its status, a diff and a direction (`note → PwnDoc`, `PwnDoc → note`, or `merge both`).
+**Compare with PwnDoc and merge sections** opens one box per section with its status and the two versions **side by side** (PwnDoc on the left, the note on the right, lines aligned, differences highlighted). For each section you choose **Skip**, **Use PwnDoc** (the note takes the PwnDoc text), **Use note** (PwnDoc takes the note text) or, when both sides changed, **Merge both**. Clicking a column header picks that side. Only Evidenza is pre-selected.
 
 | Section in the note | PwnDoc field |
 |---|---|
