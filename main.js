@@ -717,6 +717,50 @@ async function applyMerged(ctx, { auditId, findingId, noteMd, merged, snapshotFi
     return { noteMd: md };
 }
 
+// ── Create a finding ──────────────────────────────────────────────────────────
+// The finding of the audit whose title equals the note title (case and spacing ignored); null if none or ambiguous
+function matchFinding(title, findings) {
+    const hits = findings.filter(f => normTitle(f.title) === normTitle(title));
+    return hits.length === 1 ? hits[0] : null;
+}
+
+// vuln: full library entry (GET /api/vulnerabilities/detail/:id). Uses the detail in the audit language.
+function buildFindingFromLibrary(vuln, locale) {
+    const d = vuln.details.find(x => x.locale === locale) || vuln.details[0];
+    return {
+        title: d.title,
+        vulnType: d.vulnType || vuln.category,
+        ...(vuln.cvssv3 ? { cvssv3: vuln.cvssv3 } : {}),
+        description: d.description || '',
+        observation: d.observation || '',
+        remediation: d.remediation || '',
+        poc: '',
+        scope: '',
+        references: d.references || [],
+        customFields: d.customFields || [],
+    };
+}
+
+function buildFindingFromNote(title, cvssVector, vulnType) {
+    return {
+        title, vulnType,
+        ...(isValidCvss31(cvssVector) ? { cvssv3: cvssVector } : {}),
+        description: '', observation: '', remediation: '', poc: '', scope: '', references: [], customFields: [],
+    };
+}
+
+// PwnDoc's POST does not return the new id: it is the finding that was not in the audit before
+async function createFinding(ctx, auditId, body, force) {
+    const before = await ctx.api('GET', `/api/audits/${auditId}`);
+    assertEditable(before, force);
+    const known = new Set((before.findings || []).map(f => f._id));
+    await ctx.api('POST', `/api/audits/${auditId}/findings`, { body });
+    const after = await ctx.api('GET', `/api/audits/${auditId}`);
+    const created = (after.findings || []).find(f => !known.has(f._id));
+    if (!created) throw new Error('finding created but not found in the audit afterwards');
+    return created._id;
+}
+
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
 async function readFilePath(app, filePath) {
     if (/^([A-Za-z]:[\\/]|\/)/.test(filePath)) {
@@ -1617,6 +1661,29 @@ class RollbackModal extends Modal {
     onClose() { this.contentEl.empty(); }
 }
 
+// ── Modal: pick a library vuln to create the finding from (or a blank one) ────
+class LibraryVulnPickModal extends FuzzySuggestModal {
+    constructor(app, vulns, suggestedId, locale, onChoose) {
+        super(app);
+        const titleOf = v => (v.details.find(d => d.locale === locale) || v.details[0])?.title || v._id;
+        const items = vulns.map(v => ({ vuln: v, title: titleOf(v), suggested: v._id === suggestedId }));
+        items.sort((a, b) => Number(b.suggested) - Number(a.suggested));
+        this.items = [...items, { blank: true, title: 'New blank finding (title and CVSS from the note)' }];
+        this.onChoose = onChoose; // (vuln | 'blank' | null) => void
+        this.chosen = false;
+        this.setPlaceholder('Pick the library vulnerability to create the finding from...');
+    }
+    getItems() { return this.items; }
+    getItemText(i) { return i.vuln ? i.vuln.details.map(d => d.title).join(' ') : i.title; }
+    renderSuggestion(item, el) {
+        const i = item.item;
+        el.createEl('div', { text: i.title });
+        if (i.vuln) el.createEl('small', { text: [i.suggested ? 'suggested' : '', i.vuln.category, i.vuln.cvssv3].filter(Boolean).join(' · '), cls: 'pwndoc-meta' });
+    }
+    onChooseItem(i) { this.chosen = true; this.onChoose(i.blank ? 'blank' : i.vuln); }
+    onClose() { super.onClose(); setTimeout(() => { if (!this.chosen) this.onChoose(null); }, 0); }
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 class PwnDocImporterPlugin extends Plugin {
     async onload() {
@@ -1663,6 +1730,11 @@ class PwnDocImporterPlugin extends Plugin {
             id: 'rollback-from-history',
             name: 'Restore from PwnDoc sync history (rollback)',
             callback: () => this.rollbackFromHistory(),
+        });
+        this.addCommand({
+            id: 'create-finding-in-pwndoc',
+            name: 'Create PwnDoc finding for this note (from library or blank)',
+            callback: () => this.createFindingForNote(),
         });
         this.registerEvent(this.app.vault.on('rename', async (file, oldPath) => {
             if (file.children === undefined) return; // folders only
@@ -1885,8 +1957,13 @@ class PwnDocImporterPlugin extends Plugin {
         let audit;
         try { audit = await this.api('GET', `/api/audits/${auditId}`); }
         catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); return; }
+        const title = titleFromBasename(file.basename);
+        if (!matchFinding(title, audit.findings || [])
+            && await new Promise(r => new ConfirmModal(this.app, `No finding titled "${title}" in this audit. Create it now?`, r).open())) {
+            return this.createFindingForNote();
+        }
         if (!audit.findings?.length) { new Notice('PwnDoc Importer: this audit has no findings yet.'); return; }
-        new FindingPickModal(this.app, audit.findings, titleFromBasename(file.basename), async finding => {
+        new FindingPickModal(this.app, audit.findings, title, async finding => {
             await this.app.fileManager.processFrontMatter(file, fm => {
                 fm.pwndoc_audit_id = auditId;
                 fm.pwndoc_finding_id = finding._id;
@@ -2022,6 +2099,44 @@ class PwnDocImporterPlugin extends Plugin {
             if (this.app.vault.getAbstractFileByPath(target)) { new Notice(`PwnDoc Importer: cannot rename, "${target}" already exists.`); return; }
             await this.app.fileManager.renameFile(file, target);
         }
+    }
+
+    // Note without a finding: link an existing one with the same title, else create it from the library or from scratch
+    async createFindingForNote() {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) { new Notice('PwnDoc Importer: open a note first.'); return; }
+        const fm = this.app.metadataCache.getFileCache(file)?.frontmatter || {};
+        const auditId = await this.auditIdFor(file);
+        if (!auditId) return;
+        const confirm = message => new Promise(resolve => new ConfirmModal(this.app, message, resolve).open());
+        try {
+            const audit = await this.api('GET', `/api/audits/${auditId}`);
+            const title = titleFromBasename(file.basename);
+            const existing = matchFinding(title, audit.findings || []);
+            if (existing && await confirm(`The audit already has a finding titled "${existing.title}". Link this note to it instead of creating a new one?`)) {
+                await this.app.fileManager.processFrontMatter(file, f => { f.pwndoc_audit_id = auditId; f.pwndoc_finding_id = existing._id; });
+                new Notice(`PwnDoc Importer: linked to "${existing.title}"`);
+                return;
+            }
+
+            const vulns = (await this.api('GET', '/api/vulnerabilities')) || [];
+            const pick = await new Promise(resolve => new LibraryVulnPickModal(this.app, vulns, fm.pwndoc_id, audit.language, resolve).open());
+            if (!pick) return;
+            const body = pick === 'blank'
+                ? buildFindingFromNote(title, fm.cvss_vector, fm.category || 'WAPT')
+                : buildFindingFromLibrary(await this.api('GET', `/api/vulnerabilities/detail/${pick._id}`), audit.language);
+
+            const force = audit.state !== 'EDIT'
+                && await confirm(`The audit is in state ${audit.state}. Enforce: create the finding anyway?`);
+            const findingId = await createFinding({ api: (m, p, o) => this.api(m, p, o) }, auditId, body, force);
+            await this.app.fileManager.processFrontMatter(file, f => { f.pwndoc_audit_id = auditId; f.pwndoc_finding_id = findingId; });
+            await recordHistory(this.app.vault.adapter, historyDir(this.manifest.dir, findingId), {
+                ts: new Date().toISOString(), op: 'create', forced: force, auditId, findingId, notePath: file.path,
+                sections: [], remoteBefore: null, localBefore: await this.app.vault.read(file),
+            }, this.settings.historyLimit);
+            new Notice(`PwnDoc Importer: created "${body.title}"`);
+            await this.compareWithPwndoc(); // opens the merge with Evidence preselected
+        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
     }
 
     // Step 2 — ask VT or M
@@ -2176,6 +2291,6 @@ module.exports = PwnDocImporterPlugin;
 module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
-    classify, merge3, hasConflictMarkers, applyMerged, isValidCvss31, cvssFrontmatter, localValue, labelOf, historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase,
+    matchFinding, buildFindingFromLibrary, buildFindingFromNote, createFinding, classify, merge3, hasConflictMarkers, applyMerged, isValidCvss31, cvssFrontmatter, localValue, labelOf, historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase,
     AuditLockedError, assertEditable, findingHash, assertUnchanged, isEmptyValue, pushSections, pullSections,
     restoreRemotePatch, restoreLocal, buildRollbackComparison, rollbackSections };

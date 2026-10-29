@@ -662,3 +662,63 @@ test('applyMerged refuses text that still contains conflict markers', async () =
     await assert.rejects(T.applyMerged(ctx, { auditId: AID, findingId: FID, noteMd: NOTE_ONLY_POC, merged: { poc: 'a\n<<<<<<< local\nx\n=======\ny\n>>>>>>> pwndoc' }, snapshotFinding: clone(ctx.finding), force: false }), /conflict/i);
     assert.equal(ctx.log.puts.length, 0);
 });
+
+// ── create finding ────────────────────────────────────────────────────────────
+test('matchFinding matches titles ignoring case and spacing, and returns null when absent or ambiguous', () => {
+    const fs_ = [{ _id: '1', title: 'SQL  Injection' }, { _id: '2', title: 'XSS' }, { _id: '3', title: 'xss' }];
+    assert.equal(T.matchFinding('sql injection', fs_)._id, '1');
+    assert.equal(T.matchFinding('CSRF', fs_), null);
+    assert.equal(T.matchFinding('XSS', fs_), null);
+});
+
+const LIB = {
+    _id: 'L'.repeat(24), cvssv3: V, category: 'WAPT', priority: 3, remediationComplexity: 2, priorityQ: 0,
+    details: [
+        { locale: 'IT-it', title: 'Titolo', vulnType: 'WAPT', description: '<p>d-it</p>', observation: '<p>o-it</p>', remediation: '<p>r-it</p>', references: ['http://it'], customFields: [] },
+        { locale: 'EN-en', title: 'Title', vulnType: 'WAPT', description: '<p>d-en</p>', observation: '<p>o-en</p>', remediation: '<p>r-en</p>', references: ['http://en'], customFields: [{ customField: 'cf1', text: 'x' }] },
+    ],
+};
+
+test('buildFindingFromLibrary picks the detail of the audit language, falling back to the first', () => {
+    const en = T.buildFindingFromLibrary(LIB, 'EN-en');
+    assert.equal(en.title, 'Title');
+    assert.equal(en.description, '<p>d-en</p>');
+    assert.deepEqual(en.references, ['http://en']);
+    assert.equal(en.cvssv3, V);
+    assert.equal(en.vulnType, 'WAPT');
+    assert.equal(T.buildFindingFromLibrary(LIB, 'FR-fr').title, 'Titolo');
+});
+
+test('buildFindingFromNote builds a minimal finding and omits an invalid CVSS vector', () => {
+    assert.deepEqual(T.buildFindingFromNote('My title', V, 'WAPT'), { title: 'My title', vulnType: 'WAPT', cvssv3: V, description: '', observation: '', remediation: '', poc: '', scope: '', references: [], customFields: [] });
+    assert.equal('cvssv3' in T.buildFindingFromNote('t', 'nope', 'WAPT'), false);
+});
+
+function createCtx(state = 'EDIT') {
+    const log = { posts: [] };
+    const findings = [{ _id: 'x'.repeat(24), identifier: '1', title: 'existing' }];
+    return {
+        log, findings,
+        api: async (method, path, opts) => {
+            if (method === 'GET') return { _id: AID, state, findings };
+            if (method === 'POST') { log.posts.push({ path, body: opts.body }); findings.push({ _id: 'n'.repeat(24), identifier: '2', title: opts.body.title }); return 'created'; }
+            throw new Error('unexpected ' + method);
+        },
+    };
+}
+
+test('createFinding refuses on a non-EDIT audit without force, and posts once with force, returning the new id', async () => {
+    const ctx = createCtx('REVIEW');
+    await assert.rejects(T.createFinding(ctx, AID, { title: 'New' }, false), /REVIEW/);
+    assert.equal(ctx.log.posts.length, 0);
+    const id = await T.createFinding(ctx, AID, { title: 'New' }, true);
+    assert.equal(ctx.log.posts.length, 1);
+    assert.equal(ctx.log.posts[0].path, `/api/audits/${AID}/findings`);
+    assert.equal(id, 'n'.repeat(24));
+});
+
+test('createFinding returns the id of the newly created finding even when titles repeat', async () => {
+    const ctx = createCtx();
+    const id = await T.createFinding(ctx, AID, { title: 'existing' }, false);
+    assert.equal(id, 'n'.repeat(24));
+});
