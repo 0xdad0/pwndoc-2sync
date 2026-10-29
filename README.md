@@ -9,7 +9,7 @@ An [Obsidian](https://obsidian.md) plugin that imports vulnerabilities from a [P
 - API credentials can be saved in plugin settings or entered in a popup at import time
 - Optionally save the fetched API data as a local CSV for future offline use, with a configurable default output folder
 - Automatically calculate CVSS 3.1 scores and severity ratings
-- Convert HTML-formatted PwnDoc fields to clean plain text
+- Convert HTML-formatted PwnDoc fields to Markdown, keeping bold, lists, tables and code blocks
 - Generate pre-structured notes with YAML frontmatter (severity, platform, CVSS data, OWASP category, CWE)
 - Automatically fetch custom field definitions from the API and append all non-empty custom fields as a **Custom Fields** section at the end of the note, using human-readable labels (`displaySub`)
 - Filter vulnerabilities by locale (`EN-en`, `IT-it`, or all)
@@ -17,10 +17,11 @@ An [Obsidian](https://obsidian.md) plugin that imports vulnerabilities from a [P
 - Choose between **VT** (Vulnerability Ticket) or **M** (Mobile) note prefixes
 - Auto-number notes sequentially (`VT-01`, `VT-02`, …)
 - Select the target vault folder interactively on each import
+- **Engagement sync**: link notes or folders to a PwnDoc audit, compare with the finding and merge per section (push, pull or three-way), with image upload, history and rollback, title/CVSS sync and finding creation (see below)
 
 ## Requirements
 
-- Obsidian 1.0.0 or later
+- Obsidian 1.11.5 or later (uses Obsidian secret storage)
 - Desktop only (not supported on mobile)
 
 ## Installation
@@ -71,7 +72,7 @@ These values must match the `_id` of the corresponding custom fields in your Pwn
 |---|---|
 | **PwnDoc URL** | Base URL of the PwnDoc instance (e.g. `https://localhost:8443`) |
 | **Username** | PwnDoc username |
-| **Password** | PwnDoc password — stored in plain text in the plugin data file |
+| **Password** | PwnDoc password, kept in Obsidian secret storage (pick or create the secret in the settings). An old plain-text password in `data.json` is moved there automatically on first load. |
 | **Ignore SSL certificate errors** | Enable for self-signed certificates |
 
 If any credential field is left blank, the plugin will prompt for credentials at import time. Credentials can also be saved from the import popup by checking **Save credentials in plugin settings**.
@@ -114,6 +115,54 @@ Three import commands are available from the command palette (`Ctrl+P` / `Cmd+P`
    - Confirm the folder path to save the fetched data as `vulnerabilities.csv` for future offline use.
    - Click **Skip** to import without saving.
 4. The locale filter from settings is applied, then the usual fuzzy-search → prefix → folder → note flow continues.
+
+## Engagement sync
+
+Link notes to a PwnDoc **engagement (audit)**, compare them with the matching **finding** and merge section by section, in both directions. By default only the **Evidenza / proof of concept** section is selected, so evidence written in Obsidian can be pushed into a finding that is already populated on PwnDoc without touching the rest.
+
+### Associating notes
+
+| Command | What it does |
+|---|---|
+| **Associate folder to PwnDoc engagement** | Pick a vault folder and an audit. Subfolders inherit it (nearest folder wins). Renaming the folder keeps the association. New notes imported into an associated folder get `pwndoc_audit_id`. |
+| **Associate note to PwnDoc finding** | Picks the finding of the audit (best title match first) and writes `pwndoc_audit_id` and `pwndoc_finding_id` in the frontmatter. If the audit has no finding with the note title it offers to create one. |
+| **Create PwnDoc finding for this note** | Links an existing finding with the same title, otherwise creates one from a **library vulnerability** (the one in `pwndoc_id` is suggested, any other can be picked) or a **blank** finding with the note title and CVSS. Then opens the compare with Evidenza selected. |
+
+### Compare and merge
+
+**Compare with PwnDoc and merge sections** opens one row per section with its status, a diff and a direction (`note → PwnDoc`, `PwnDoc → note`, or `merge both`).
+
+| Section in the note | PwnDoc field |
+|---|---|
+| Descrizione | `description` |
+| Impatto | `observation` |
+| **Evidenza** (default) | `poc` |
+| Assets | `scope` |
+| Remediation | `remediation` |
+| References | `references` |
+| Title (file name after `VT-NN - `) | `title` |
+| CVSS vector (`cvss_vector`) | `cvssv3` |
+| Custom Fields | shown in the diff only, never written |
+
+- **Three-way status.** After every successful sync the plugin stores the synced text of each section as a base. A section is then `changed in the note`, `changed on PwnDoc`, `changed on both sides` or `identical`; the direction is preselected accordingly. When both sides changed, a line-level three-way merge is proposed in an editable box: changes on different lines are combined, changes on the same or adjacent lines produce `<<<<<<< local / ======= / >>>>>>> pwndoc` markers that must be resolved before **Apply** works. Without a base (first sync) the comparison is two-way.
+- **Images.** Images in the section (`![alt](path)` and `![[path|alt]]`) are uploaded to PwnDoc and referenced as `<img src="<id>" alt="<alt>">`; the alt text is the caption. Uploads are cached by content hash, so repeating a push does not re-upload. Pulling downloads PwnDoc images into the **attachments folder** and rewrites them to vault links. Images above 12 MB, remote `http(s)` images and unsupported types are rejected before anything is written.
+- **Formatting.** Notes are converted to the HTML subset PwnDoc stores (paragraphs, bold/italic, lists, tables, code blocks, links, images); PwnDoc HTML is converted to Markdown on pull.
+- **Empty sections.** Overwriting a populated section with an empty one (either direction) asks for confirmation.
+- **Only the selected fields are written** (the finding update is a patch), and a push is aborted if the selected fields changed on PwnDoc after you opened the compare.
+- **Audit state guard.** Writing to PwnDoc requires the audit to be in state `EDIT`. Otherwise the dialog shows the state and an **Enforce** checkbox (off by default, valid for that operation only); forced operations are marked in the history. Pulling is local and is never blocked.
+
+### History and rollback
+
+Every push, pull, merge, rollback and finding creation stores the finding and the note as they were **before** the operation in `<vault>/.obsidian/plugins/pwndoc-importer/history/<findingId>/` (the last *History entries per finding* are kept). **Restore from PwnDoc sync history (rollback)** lets you pick an entry and restore chosen sections either on PwnDoc or in the note, through the same diff dialog and guards. A rollback is itself recorded, so it can be rolled back. Uploaded images are never deleted, so restored evidence keeps its pictures.
+
+The history folder contains client data: do not commit it (`history/` and `data.json` are git-ignored in this repository).
+
+### Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| **Attachments folder** | `attachments` | Vault folder where images pulled from PwnDoc are saved |
+| **History entries per finding** | `50` | Older history entries are pruned |
 
 ## Generated Note Structure
 

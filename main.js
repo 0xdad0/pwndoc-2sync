@@ -1331,6 +1331,26 @@ class PwnDocSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.csvOutputFolder)
                 .onChange(async v => { this.plugin.settings.csvOutputFolder = v.trim(); await this.plugin.saveSettings(); }));
 
+        containerEl.createEl('h3', { text: 'Engagement sync' });
+
+        new Setting(containerEl)
+            .setName('Attachments folder')
+            .setDesc('Vault folder where images pulled from PwnDoc are saved')
+            .addText(t => t
+                .setPlaceholder('attachments')
+                .setValue(this.plugin.settings.attachmentsFolder)
+                .onChange(async v => { this.plugin.settings.attachmentsFolder = v.trim().replace(/\/+$/, ''); await this.plugin.saveSettings(); }));
+
+        new Setting(containerEl)
+            .setName('History entries per finding')
+            .setDesc('How many push/pull/merge/rollback snapshots are kept for each finding; older ones are deleted')
+            .addText(t => t
+                .setValue(String(this.plugin.settings.historyLimit))
+                .onChange(async v => {
+                    const n = parseInt(v, 10);
+                    if (n >= 1) { this.plugin.settings.historyLimit = n; await this.plugin.saveSettings(); }
+                }));
+
         containerEl.createEl('h3', { text: 'Debug' });
 
         new Setting(containerEl)
