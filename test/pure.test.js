@@ -1223,3 +1223,31 @@ test('reportFailureLines names the missing fields, or says the general informati
         'Missing in General Information:', '- Client', '- Start date', 'Fill them in on PwnDoc (Audit, General) and generate the report again.']);
     assert.match(T.reportFailureLines(e, 'Acme', []).join('\n'), /looks complete.*template/s);
 });
+
+// ── dashboard view helpers ────────────────────────────────────────────────────
+const DROWS = [
+    { path: 'a.md', title: 'Beta', state: 'same', sections: {} },
+    { path: 'b.md', title: 'Alpha', state: 'conflict', sections: {} },
+    { path: 'c.md', title: 'Gamma', state: 'local', sections: { poc: { status: 'local', localEmpty: false, remoteEmpty: false }, scope: { status: 'conflict', localEmpty: false } } },
+    { path: 'd.md', title: 'Delta', state: 'remote', sections: { poc: { status: 'remote', localEmpty: false } } },
+    { path: 'e.md', title: 'Alpha2', state: 'local', sections: { poc: { status: 'local', localEmpty: false } } },
+];
+
+test('sortDashboardRows puts what needs attention first, then by title', () => {
+    assert.deepEqual(T.sortDashboardRows(DROWS).map(r => r.title), ['Alpha', 'Alpha2', 'Gamma', 'Delta', 'Beta']);
+});
+
+test('dashboardCounts and filterDashboardRows', () => {
+    assert.deepEqual(T.dashboardCounts(DROWS), { same: 1, conflict: 1, local: 2, remote: 1 });
+    assert.deepEqual(T.filterDashboardRows(DROWS, { state: 'local' }).map(r => r.path), ['c.md', 'e.md']);
+    assert.deepEqual(T.filterDashboardRows(DROWS, { query: 'ALPHA' }).map(r => r.path), ['b.md', 'e.md']);
+    assert.deepEqual(T.filterDashboardRows(DROWS, { state: 'local', query: 'gam' }).map(r => r.path), ['c.md']);
+    assert.equal(T.filterDashboardRows(DROWS, {}).length, 5);
+});
+
+test('bulkSummary tells how many notes and sections a bulk push or pull would write, and what it skips', () => {
+    const sel = DROWS.filter(r => ['c.md', 'd.md', 'e.md'].includes(r.path));
+    assert.deepEqual(T.bulkSummary(sel, 'push', ['poc', 'scope']), { notes: 2, sections: 2, skipped: 2 });
+    assert.deepEqual(T.bulkSummary(sel, 'pull', ['poc']), { notes: 1, sections: 1, skipped: 2 });
+    assert.deepEqual(T.bulkSummary([], 'push', ['poc']), { notes: 0, sections: 0, skipped: 0 });
+});

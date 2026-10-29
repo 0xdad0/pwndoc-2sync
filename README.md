@@ -185,11 +185,18 @@ An empty priority or complexity in the note is never pushed (it would blank the 
 
 ### Engagement dashboard and bulk sync
 
-**Engagement dashboard** (command, status-bar menu, or right-click a folder) reads the engagement once and shows one row per linked note: finding completed or in progress, sync state (`in sync`, `changed in the note`, `changed on PwnDoc`, `conflict`, `differs, no sync base`) and which sections differ. Only sections that matter are counted: Evidenza, plus any other section that has content in the note or a sync base. From the dashboard:
+**Engagement dashboard** (command, status-bar menu, or right-click a folder) reads the engagement once. The header shows the engagement, its state, the report template and the language; four tabs separate what was mixed before:
 
-- **Open** / **Compare** a note.
-- **Push selected sections** / **Pull selected sections** for the ticked notes, for the sections ticked above the list (Evidenza by default). The plugin never overwrites a side that changed on its own: a push skips sections changed on PwnDoc or in conflict, a pull skips sections changed in the note or in conflict, an empty note section is not pushed, and a section that differs with no sync base yet is left to **Compare** (a bulk push then only fills what PwnDoc does not have, a bulk pull only what the note does not have). The skipped ones are listed at the end. The usual guards apply (state `EDIT` or **Enforce**, changed-since-read check, history entry per note, lint errors skip the note).
-- Lists the **orphan notes** (their finding or engagement is gone from PwnDoc) with **Unlink**, the notes without a finding, and the findings that have no note, with a shortcut to import them.
+| Tab | Content |
+|---|---|
+| **Notes** | One row per note linked to a finding: title and path, finding completed or in progress, sync state as a coloured pill (`conflict`, `note changed`, `PwnDoc changed`, `no sync base`, `in sync`) and the sections that differ. Rows needing attention come first. |
+| **No finding yet** | Notes of the engagement not linked to a finding. Open one and run *Send note to PwnDoc*. |
+| **Orphans** | Notes whose finding or engagement is gone from PwnDoc, with the reason and **Unlink**. |
+| **Only on PwnDoc** | Findings with no note, and a button to import them. |
+
+In the **Notes** tab: filter by state with the chips, search by title, tick rows (or the header box to tick the visible ones), pick the sections for bulk actions in the *Sections* drop-down (Evidenza by default), then **Push** or **Pull**. The bar at the bottom previews the action for the ticked notes, for example "Push would write 3 section(s) in 2 note(s)", and the button shows how many notes it will touch; it is disabled when nothing would be written. Per row, **Open** and **Compare**.
+
+A bulk action never overwrites a side that changed on its own: a push skips sections changed on PwnDoc or in conflict, a pull skips sections changed in the note or in conflict, an empty note section is not pushed, and a section that differs with no sync base yet is left to **Compare** (a bulk push then only fills what PwnDoc does not have, a bulk pull only what the note does not have). On an audit not in state `EDIT`, Push stays disabled until you tick **Enforce**. The usual guards apply (changed-since-read check, history entry per note, lint errors skip the note) and the skipped sections are listed at the end.
 
 ### Lint before a push
 

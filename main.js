@@ -1105,6 +1105,23 @@ function bulkPlan(row, direction, keys) {
     return { run, blocked };
 }
 
+// ── Dashboard view: order, filter, preview of a bulk action ───────────────────
+const sortDashboardRows = rows => [...rows].sort((a, b) => STATE_RANK[b.state] - STATE_RANK[a.state] || a.title.localeCompare(b.title));
+const dashboardCounts = rows => rows.reduce((c, r) => ({ ...c, [r.state]: (c[r.state] || 0) + 1 }), {});
+const filterDashboardRows = (rows, { state = '', query = '' }) =>
+    rows.filter(r => (!state || r.state === state) && r.title.toLowerCase().includes(query.toLowerCase()));
+
+// What a bulk push or pull of `keys` over `rows` would do: notes written, sections written, sections skipped
+function bulkSummary(rows, direction, keys) {
+    const out = { notes: 0, sections: 0, skipped: 0 };
+    for (const r of rows) {
+        const p = bulkPlan(r, direction, keys);
+        if (p.run.length) { out.notes++; out.sections += p.run.length; }
+        out.skipped += p.blocked.length;
+    }
+    return out;
+}
+
 // ── Report template of the engagement and report generation ───────────────────
 const templateIdOf = audit => audit.template?._id ?? audit.template ?? null;
 
@@ -2311,115 +2328,207 @@ class TemplatePickModal extends SuggestModal {
 
 // ── Modal: engagement dashboard and orphan list ───────────────────────────────
 // data: buildDashboard() result (rows may be empty for the orphan view); audit: the PwnDoc audit or null
+// One tab per kind of thing: notes in sync with a finding, notes without a finding, orphans, findings without a note
 class DashboardModal extends Modal {
-    constructor(app, plugin, data, { title, audit }) {
+    constructor(app, plugin, data, { title, subtitle = '', audit }) {
         super(app);
         this.plugin = plugin;
         this.data = data;
         this.title = title;
+        this.subtitle = subtitle;
         this.audit = audit;
     }
 
     onOpen() {
         const { contentEl, data, audit } = this;
         contentEl.empty();
-        this.modalEl.style.width = 'min(920px, 95vw)';
-        contentEl.createEl('h3', { text: this.title });
-        const COLOR = { same: 'var(--text-success)', unknown: 'var(--text-muted)', remote: 'var(--text-accent)', local: 'var(--text-warning)', conflict: 'var(--text-error)' };
-        const LABEL = { same: 'in sync', unknown: 'differs, no sync base', remote: 'changed on PwnDoc', local: 'changed in the note', conflict: 'conflict' };
+        this.modalEl.style.width = 'min(980px, 96vw)';
+        const STATE = {
+            conflict: ['conflict', 'var(--text-error)'], local: ['note changed', 'var(--text-warning)'], remote: ['PwnDoc changed', 'var(--text-accent)'],
+            unknown: ['no sync base', 'var(--text-muted)'], same: ['in sync', 'var(--text-success)'],
+        };
         const open = async path => {
             const f = this.app.vault.getAbstractFileByPath(path);
             if (f) await this.app.workspace.getLeaf().openFile(f);
         };
-        const line = parent => {
-            const d = parent.createEl('div');
-            d.style.cssText = 'display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--background-modifier-border);';
-            return d;
+        const css = (el, text) => { el.style.cssText = text; return el; };
+        const btn = (parent, text, fn, small = true) => {
+            const b = parent.createEl('button', { text });
+            if (small) css(b, 'padding:2px 10px;font-size:0.85em;');
+            b.onclick = fn;
+            return b;
         };
-        const btn = (parent, text, fn) => { const b = parent.createEl('button', { text }); b.onclick = fn; return b; };
+        const pill = (parent, text, color) =>
+            css(parent.createEl('span', { text }), `color:${color};border:1px solid ${color};border-radius:10px;padding:0 8px;font-size:0.78em;white-space:nowrap;`);
+        const note = (parent, text) => css(parent.createEl('p', { text }), 'color:var(--text-muted);font-size:0.9em;margin:4px 0 10px;');
 
-        const selected = new Set(DEFAULT_SYNC_SECTIONS);
-        const checks = [];
-        let forceBox = null;
+        // view state
+        const sel = new Set();
+        const sections = new Set(DEFAULT_SYNC_SECTIONS);
+        const view = { tab: '', state: '', query: '', force: false };
+        const rowsSorted = sortDashboardRows(data.rows);
 
-        if (data.rows.length) {
-            const counts = data.rows.reduce((c, r) => ({ ...c, [r.state]: (c[r.state] || 0) + 1 }), {});
-            contentEl.createEl('small', { text: Object.entries(counts).map(([k, v]) => `${v} ${LABEL[k]}`).join(' · '), cls: 'pwndoc-meta' });
+        css(contentEl.createEl('h3', { text: this.title }), 'margin-bottom:2px;');
+        if (this.subtitle) css(contentEl.createEl('div', { text: this.subtitle }), 'color:var(--text-muted);font-size:0.85em;margin-bottom:10px;');
 
-            const secs = contentEl.createEl('div');
-            secs.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px 12px;margin:8px 0;';
-            secs.createEl('strong', { text: 'Sections for bulk actions:' });
+        const tabsEl = contentEl.createEl('div');
+        const bodyEl = contentEl.createEl('div');
+        const footEl = contentEl.createEl('div');
+
+        const TABS = [
+            ['notes', 'Notes', data.rows.length], ['unlinked', 'No finding yet', data.unlinked.length],
+            ['orphans', 'Orphans', data.orphans.length], ['missing', 'Only on PwnDoc', data.missing.length],
+        ].filter(t => t[2]);
+        if (!TABS.length) { contentEl.createEl('p', { text: 'Nothing to show.' }); return; }
+        view.tab = TABS[0][0];
+
+        const renderTabs = () => {
+            tabsEl.empty();
+            css(tabsEl, 'display:flex;gap:4px;border-bottom:1px solid var(--background-modifier-border);margin-bottom:10px;');
+            for (const [id, label, n] of TABS) {
+                const b = tabsEl.createEl('button', { text: `${label} (${n})` });
+                css(b, `border:none;border-radius:6px 6px 0 0;box-shadow:none;padding:4px 12px;background:${view.tab === id ? 'var(--background-modifier-active-hover)' : 'transparent'};font-weight:${view.tab === id ? '600' : '400'};`);
+                b.onclick = () => { view.tab = id; renderAll(); };
+            }
+        };
+
+        const selectedRows = () => data.rows.filter(r => sel.has(r.path));
+
+        const renderFoot = () => {
+            footEl.empty();
+            if (view.tab !== 'notes') return;
+            css(footEl, 'display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:12px;padding-top:10px;border-top:1px solid var(--background-modifier-border);');
+            const rows = selectedRows();
+            const keys = [...sections];
+            const push = bulkSummary(rows, 'push', keys), pull = bulkSummary(rows, 'pull', keys);
+            const info = css(footEl.createEl('div'), 'flex:1;min-width:240px;font-size:0.85em;color:var(--text-muted);');
+            info.setText(rows.length
+                ? `${rows.length} selected. Push would write ${push.sections} section(s) in ${push.notes} note(s); pull ${pull.sections} in ${pull.notes}. Never overwrites a side that changed on its own.`
+                : 'Tick the notes to push or pull the chosen sections in bulk.');
+            const locked = audit && audit.state !== 'EDIT';
+            if (locked) {
+                const w = footEl.createEl('label');
+                const c = w.createEl('input', { type: 'checkbox' });
+                c.checked = view.force;
+                c.onchange = () => { view.force = c.checked; renderFoot(); };
+                w.createEl('span', { text: ` Enforce (audit is ${audit.state})` });
+            }
+            const go = direction => async () => {
+                this.close();
+                await this.plugin.bulkSync(audit, rows, keys, direction, view.force);
+            };
+            const pushBtn = btn(footEl, `Push ${push.notes ? `(${push.notes})` : ''}`, go('push'), false);
+            pushBtn.addClass('mod-cta');
+            pushBtn.disabled = !push.notes || (locked && !view.force);
+            if (locked && !view.force) pushBtn.title = `Audit is ${audit.state}: tick Enforce to write`;
+            const pullBtn = btn(footEl, `Pull ${pull.notes ? `(${pull.notes})` : ''}`, go('pull'), false);
+            pullBtn.disabled = !pull.notes;
+        };
+
+        const renderNotes = () => {
+            // filters: state chips, search, sections
+            const bar = css(bodyEl.createEl('div'), 'display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:8px;');
+            const counts = dashboardCounts(data.rows);
+            const chip = (label, state, n) => {
+                const on = view.state === state;
+                const b = bar.createEl('button', { text: `${label} ${n}` });
+                css(b, `padding:1px 10px;font-size:0.82em;border-radius:12px;${on ? 'background:var(--interactive-accent);color:var(--text-on-accent);' : ''}`);
+                b.onclick = () => { view.state = on ? '' : state; renderAll(); };
+            };
+            chip('All', '', data.rows.length);
+            for (const k of ['conflict', 'local', 'remote', 'unknown', 'same']) if (counts[k]) chip(STATE[k][0], k, counts[k]);
+            const search = bar.createEl('input', { type: 'search', placeholder: 'Filter by title...' });
+            css(search, 'margin-left:auto;width:180px;');
+            search.value = view.query;
+            search.oninput = () => { view.query = search.value; renderList(); renderFoot(); };
+
+            // sections to push or pull in bulk
+            const det = css(bodyEl.createEl('details'), 'margin-bottom:8px;');
+            const sum = det.createEl('summary');
+            const sumText = () => sum.setText(`Sections for bulk actions: ${[...sections].map(k => labelOf(defOf(k))).join(', ') || 'none'}`);
+            sumText();
+            const grid = css(det.createEl('div'), 'display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:2px 12px;padding:6px 0;');
             for (const def of SECTION_DEFS) {
-                const l = secs.createEl('label');
+                const l = grid.createEl('label');
                 const c = l.createEl('input', { type: 'checkbox' });
-                c.checked = selected.has(def.key);
-                c.onchange = () => (c.checked ? selected.add(def.key) : selected.delete(def.key));
+                c.checked = sections.has(def.key);
+                c.onchange = () => { c.checked ? sections.add(def.key) : sections.delete(def.key); sumText(); renderFoot(); };
                 l.createEl('span', { text: ' ' + labelOf(def) });
             }
 
-            for (const row of data.rows) {
-                const l = line(contentEl);
-                const c = l.createEl('input', { type: 'checkbox' });
-                checks.push({ c, row });
-                const t = l.createEl('span', { text: row.title });
-                t.style.flex = '1';
-                l.createEl('small', { text: row.completed ? '✓ completed' : 'in progress', cls: 'pwndoc-meta' });
-                const st = l.createEl('span', { text: LABEL[row.state] });
-                st.style.cssText = `color:${COLOR[row.state]};min-width:150px;`;
-                l.createEl('small', { text: row.changed.map(k => labelOf(defOf(k))).join(', '), cls: 'pwndoc-meta' });
-                btn(l, 'Open', () => open(row.path));
-                btn(l, 'Compare', async () => { this.close(); await open(row.path); this.plugin.compareWithPwndoc(); });
-            }
-
-            const bar = contentEl.createEl('div');
-            bar.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px;';
-            btn(bar, 'Select all', () => checks.forEach(x => { x.c.checked = true; }));
-            btn(bar, 'Select changed', () => checks.forEach(x => { x.c.checked = x.row.state !== 'same'; }));
-            if (audit && audit.state !== 'EDIT') {
-                const w = bar.createEl('label');
-                forceBox = w.createEl('input', { type: 'checkbox' });
-                w.createEl('span', { text: ` Enforce (audit is ${audit.state})` });
-            }
-            const run = direction => async () => {
-                const rows = checks.filter(x => x.c.checked).map(x => x.row);
-                if (!rows.length || !selected.size) { new Notice('PwnDoc 2Sync: select at least one note and one section.'); return; }
-                this.close();
-                await this.plugin.bulkSync(audit, rows, [...selected], direction, !!forceBox?.checked);
-            };
-            const push = btn(bar, 'Push selected sections', run('push'));
-            push.addClass('mod-cta');
-            push.style.marginLeft = 'auto';
-            btn(bar, 'Pull selected sections', run('pull'));
-        }
-
-        const block = (title, items, render) => {
-            if (!items.length) return;
-            contentEl.createEl('h4', { text: `${title} (${items.length})` });
-            for (const it of items) render(line(contentEl), it);
+            listEl = bodyEl.createEl('div');
+            renderList();
         };
-        block('Orphan notes', data.orphans, (l, o) => {
-            const t = l.createEl('span', { text: o.path });
-            t.style.flex = '1';
-            l.createEl('small', { text: o.reason, cls: 'pwndoc-meta' });
-            btn(l, 'Open', () => open(o.path));
-            btn(l, 'Unlink', async () => { if (await this.plugin.unlinkNote(this.app.vault.getAbstractFileByPath(o.path))) l.remove(); });
-        });
-        block('Notes without a finding', data.unlinked, (l, n) => {
-            const t = l.createEl('span', { text: n.path });
-            t.style.flex = '1';
-            btn(l, 'Open', () => open(n.path));
-        });
-        block('Findings on PwnDoc without a note', data.missing, (l, f) => {
-            const t = l.createEl('span', { text: f.title });
-            t.style.flex = '1';
-            l.createEl('small', { text: `#${f.identifier ?? ''}`, cls: 'pwndoc-meta' });
-        });
-        if (data.missing.length && audit) {
-            btn(contentEl, 'Import the missing findings...', () => { this.close(); this.plugin.importFindingsFromPwndoc(undefined, audit._id); }).style.marginTop = '8px';
-        }
-        if (!data.rows.length && !data.orphans.length && !data.unlinked.length && !data.missing.length) {
-            contentEl.createEl('p', { text: 'Nothing to show.' });
-        }
+
+        let listEl = null;
+        const COLS = '24px minmax(160px,1fr) 78px 112px minmax(120px,1.1fr) 130px';
+        const renderList = () => {
+            listEl.empty();
+            const rows = filterDashboardRows(rowsSorted, view);
+            const head = css(listEl.createEl('div'), `display:grid;grid-template-columns:${COLS};gap:8px;align-items:center;padding:4px 6px;font-size:0.78em;color:var(--text-muted);border-bottom:1px solid var(--background-modifier-border);`);
+            const all = head.createEl('input', { type: 'checkbox' });
+            all.checked = rows.length > 0 && rows.every(r => sel.has(r.path));
+            all.onchange = () => { rows.forEach(r => (all.checked ? sel.add(r.path) : sel.delete(r.path))); renderList(); renderFoot(); };
+            for (const h of ['Note', 'Finding', 'Sync', 'Differs in', '']) head.createEl('span', { text: h });
+            if (!rows.length) { note(listEl, 'No note matches the filter.'); return; }
+            const wrap = css(listEl.createEl('div'), 'max-height:48vh;overflow:auto;');
+            for (const r of rows) {
+                const line = css(wrap.createEl('div'), `display:grid;grid-template-columns:${COLS};gap:8px;align-items:center;padding:5px 6px;border-bottom:1px solid var(--background-modifier-border);`);
+                const c = line.createEl('input', { type: 'checkbox' });
+                c.checked = sel.has(r.path);
+                c.onchange = () => { c.checked ? sel.add(r.path) : sel.delete(r.path); renderFoot(); };
+                const t = line.createEl('div');
+                css(t.createEl('div', { text: r.title }), 'font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;');
+                css(t.createEl('div', { text: r.path }), 'font-size:0.75em;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;');
+                t.title = r.path;
+                css(line.createEl('span', { text: r.completed ? 'completed' : 'in progress' }), `font-size:0.8em;color:${r.completed ? 'var(--text-success)' : 'var(--text-muted)'};`);
+                pill(line, STATE[r.state][0], STATE[r.state][1]);
+                const diffs = css(line.createEl('div'), 'display:flex;flex-wrap:wrap;gap:3px;');
+                for (const k of r.changed.slice(0, 3)) css(diffs.createEl('span', { text: labelOf(defOf(k)) }), 'font-size:0.75em;background:var(--background-secondary);border-radius:4px;padding:0 5px;');
+                if (r.changed.length > 3) css(diffs.createEl('span', { text: `+${r.changed.length - 3}`, title: r.changed.slice(3).map(k => labelOf(defOf(k))).join(', ') }), 'font-size:0.75em;color:var(--text-muted);');
+                const acts = css(line.createEl('div'), 'display:flex;gap:4px;justify-content:flex-end;');
+                btn(acts, 'Open', () => open(r.path));
+                btn(acts, 'Compare', async () => { this.close(); await open(r.path); this.plugin.compareWithPwndoc(); });
+            }
+        };
+
+        const simpleList = (items, render) => {
+            const wrap = css(bodyEl.createEl('div'), 'max-height:52vh;overflow:auto;');
+            for (const it of items) {
+                const l = css(wrap.createEl('div'), 'display:flex;align-items:center;gap:8px;padding:5px 6px;border-bottom:1px solid var(--background-modifier-border);');
+                render(l, it);
+            }
+        };
+        const renderOther = () => {
+            if (view.tab === 'unlinked') {
+                note(bodyEl, 'Notes of this engagement that are not linked to a finding yet. Open one and run "Send note to PwnDoc" to pick or create its finding.');
+                simpleList(data.unlinked, (l, n) => { css(l.createEl('span', { text: n.path }), 'flex:1;'); btn(l, 'Open', () => open(n.path)); });
+            } else if (view.tab === 'orphans') {
+                note(bodyEl, 'These notes point to a finding (or an engagement) that no longer exists on PwnDoc. Unlink them, then link them again with "Send note to PwnDoc". Nothing is changed on PwnDoc.');
+                simpleList(data.orphans, (l, o) => {
+                    const t = css(l.createEl('div'), 'flex:1;');
+                    t.createEl('div', { text: o.path });
+                    css(t.createEl('div', { text: o.reason }), 'font-size:0.75em;color:var(--text-muted);');
+                    btn(l, 'Open', () => open(o.path));
+                    btn(l, 'Unlink', async () => { if (await this.plugin.unlinkNote(this.app.vault.getAbstractFileByPath(o.path))) l.remove(); });
+                });
+            } else if (view.tab === 'missing') {
+                note(bodyEl, 'Findings of the engagement that no note points to. Importing creates the notes from PwnDoc; it never writes to PwnDoc.');
+                if (audit) btn(bodyEl, 'Import these findings...', () => { this.close(); this.plugin.importFindingsFromPwndoc(undefined, audit._id); }, false).addClass('mod-cta');
+                simpleList(data.missing, (l, f) => {
+                    css(l.createEl('span', { text: f.title }), 'flex:1;');
+                    css(l.createEl('small', { text: [`#${f.identifier ?? ''}`, f.status === STATUS_DONE ? 'completed' : 'in progress'].join(' · ') }), 'color:var(--text-muted);');
+                });
+            }
+        };
+
+        const renderAll = () => {
+            renderTabs();
+            bodyEl.empty();
+            if (view.tab === 'notes') renderNotes(); else renderOther();
+            renderFoot();
+        };
+        renderAll();
     }
 
     onClose() { this.contentEl.empty(); }
@@ -3170,7 +3279,7 @@ class PwnDocImporterPlugin extends Plugin {
                 { audit, notes: await this.notesOfAudit(auditId), linkedIds: this.linkedFindingIds(),
                   loadBase: id => loadBase(this.app.vault.adapter, historyDir(this.manifest.dir, id)) });
             const tpl = await this.api('GET', '/api/templates').then(t => templateLabel(audit, t || []), () => null);
-            new DashboardModal(this.app, this, data, { title: `${audit.name} (${audit.state})${tpl ? ` · report template: ${tpl}` : ''}`, audit }).open();
+            new DashboardModal(this.app, this, data, { title: audit.name, subtitle: [`state ${audit.state}`, tpl && `report template: ${tpl}`, audit.language].filter(Boolean).join(' · '), audit }).open();
         } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
         finally { notice.hide(); }
     }
@@ -3238,7 +3347,7 @@ class PwnDocImporterPlugin extends Plugin {
                     if (reason) orphans.push({ path: n.path, findingId: n.fm.pwndoc_finding_id, reason });
                 }
             }
-            new DashboardModal(this.app, this, { rows: [], orphans, unlinked: [], missing: [] }, { title: 'Orphan notes', audit: null }).open();
+            new DashboardModal(this.app, this, { rows: [], orphans, unlinked: [], missing: [] }, { title: 'Orphan notes', subtitle: 'linked notes whose finding or engagement is gone from PwnDoc', audit: null }).open();
         } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
         finally { notice.hide(); }
     }
@@ -3567,7 +3676,7 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { missingGeneralFields, reportFailureLines, GENERAL_FIELDS, DEFAULT_GENERAL_REQUIRED, setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
+module.exports.__test = { sortDashboardRows, dashboardCounts, filterDashboardRows, bulkSummary, missingGeneralFields, reportFailureLines, GENERAL_FIELDS, DEFAULT_GENERAL_REQUIRED, setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
     sideBySide, missingFindings, findingToNoteRow, IMPORT_SECTIONS, folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,
