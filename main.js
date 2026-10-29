@@ -368,7 +368,7 @@ const listLines = text => text.split(/\n|; /).map(l => l.replace(/^\s*[-*]\s+/, 
 
 // ctx: { normalize(md) -> Promise<string>, htmlToMd(html) -> string, cfLabels }
 // One row per requested section: local and remote in comparison form, plus emptiness flags used to guard overwrites
-async function buildComparison(ctx, noteMd, finding, keys, noteInfo = {}) {
+async function buildComparison(ctx, noteMd, finding, keys, noteInfo = {}, base = null) {
     const secs = parseSections(noteMd);
     const rows = [];
     for (const key of keys) {
@@ -388,7 +388,10 @@ async function buildComparison(ctx, noteMd, finding, keys, noteInfo = {}) {
             local = localRaw.trim();
             remote = String(finding[def.field] || '').trim();
         }
-        rows.push({ key, local, remote, changed: local !== remote, localEmpty: local === '', remoteEmpty: remote === '', diff: lineDiff(remote, local) });
+        const baseText = base?.sections?.[key];
+        const status = classify(baseText, local, remote);
+        const merge = status === 'conflict' && !def.source && !def.readOnly ? merge3(baseText, local, remote) : null;
+        rows.push({ key, local, remote, base: baseText, status, merge, changed: local !== remote, localEmpty: local === '', remoteEmpty: remote === '', diff: lineDiff(remote, local) });
     }
     return rows;
 }
@@ -496,7 +499,7 @@ async function fetchFinding(ctx, auditId, findingId) {
 
 // ctx: see Plugin.syncCtx. Writes PwnDoc: only the patch of the selected fields (PUT merges), after the
 // state guard, the changed-since-compare check and a history entry. Nothing is written if any step throws.
-async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapshotFinding, force }) {
+async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapshotFinding, force, op = 'push', localBefore = noteMd }) {
     const defs = sections.map(defOf);
     const ro = defs.find(d => d.readOnly);
     if (ro) throw new Error(`section ${ro.key} is read-only`);
@@ -517,8 +520,8 @@ async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapsho
     }
     const ts = new Date().toISOString();
     const entryId = await recordHistory(ctx.adapter, ctx.historyDir, {
-        ts, op: 'push', forced: !!force && audit.state !== 'EDIT', auditId, findingId, notePath: ctx.notePath,
-        sections, remoteBefore: fresh, localBefore: noteMd,
+        ts, op, forced: !!force && audit.state !== 'EDIT', auditId, findingId, notePath: ctx.notePath,
+        sections, remoteBefore: fresh, localBefore,
     }, ctx.historyLimit);
     await ctx.api('PUT', `/api/audits/${auditId}/findings/${findingId}`, { body: patch });
     await saveBase(ctx.adapter, ctx.historyDir, { ts, sections: baseSections });
@@ -643,6 +646,75 @@ function cvssFrontmatter(vector) {
 function localValue(info, def) {
     if (def.source === 'filename') return titleFromBasename(info.basename || '');
     return String(info.fm?.[def.fmKey] ?? '');
+}
+
+// ── Three-way merge ───────────────────────────────────────────────────────────
+// base = the section as it was at the last successful sync (history/<finding>/base.json)
+function classify(base, local, remote) {
+    if (local === remote) return 'same';
+    if (base === undefined) return 'unknown';
+    if (local === base) return 'remote';
+    if (remote === base) return 'local';
+    return 'conflict';
+}
+
+const CONFLICT_MARKER_RE = /^(<<<<<<< local|=======|>>>>>>> pwndoc)$/m;
+const hasConflictMarkers = text => CONFLICT_MARKER_RE.test(text);
+
+// m[i] = index in x of the line matched to b[i] by the LCS, or -1
+function align(b, x) {
+    const lcs = Array.from({ length: b.length + 1 }, () => new Array(x.length + 1).fill(0));
+    for (let i = b.length - 1; i >= 0; i--) {
+        for (let j = x.length - 1; j >= 0; j--) {
+            lcs[i][j] = b[i] === x[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+        }
+    }
+    const m = new Array(b.length).fill(-1);
+    for (let i = 0, j = 0; i < b.length && j < x.length;) {
+        if (b[i] === x[j]) { m[i++] = j++; }
+        else if (lcs[i + 1][j] >= lcs[i][j + 1]) i++;
+        else j++;
+    }
+    return m;
+}
+
+// Line-level diff3. Like git, changes on adjacent lines are a conflict.
+// ponytail: line granularity, split by word if conflicts on long paragraphs become a nuisance
+function merge3(base, local, remote) {
+    const split = s => (s === '' ? [] : s.split('\n'));
+    const b = split(base), l = split(local), r = split(remote);
+    const ml = align(b, l), mr = align(b, r);
+    const same = (x, y) => x.length === y.length && x.every((v, k) => v === y[k]);
+    const out = [];
+    let conflicts = 0;
+    let pb = -1, pl = -1, pr = -1;
+    const hunk = (i, li, ri) => {
+        const B = b.slice(pb + 1, i), L = l.slice(pl + 1, li), R = r.slice(pr + 1, ri);
+        if (same(L, B)) out.push(...R);
+        else if (same(R, B) || same(L, R)) out.push(...L);
+        else { conflicts++; out.push('<<<<<<< local', ...L, '=======', ...R, '>>>>>>> pwndoc'); }
+    };
+    for (let i = 0; i < b.length; i++) {
+        if (ml[i] < 0 || mr[i] < 0) continue;
+        hunk(i, ml[i], mr[i]);
+        out.push(b[i]);
+        pb = i; pl = ml[i]; pr = mr[i];
+    }
+    hunk(b.length, l.length, r.length);
+    return { text: out.join('\n'), conflicts };
+}
+
+// Apply user-resolved texts: write them to PwnDoc (one PUT) and into the note. Returns the new note text.
+async function applyMerged(ctx, { auditId, findingId, noteMd, merged, snapshotFinding, force }) {
+    const keys = Object.keys(merged);
+    let md = noteMd;
+    for (const key of keys) {
+        if (hasConflictMarkers(merged[key])) throw new Error(`section ${key} still has merge conflict markers`);
+        // the remote side of the text carries PwnDoc image ids: bring those images into the vault first
+        md = replaceSection(md, key, await pullImages(ctx, merged[key], ctx.attachmentsFolder));
+    }
+    await pushSections(ctx, { auditId, findingId, noteMd: md, sections: keys, snapshotFinding, force, op: 'merge', localBefore: noteMd });
+    return { noteMd: md };
 }
 
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
@@ -1363,8 +1435,8 @@ class ConfirmModal extends Modal {
     onClose() { this.contentEl.empty(); if (!this.answered) this.onAnswer(false); }
 }
 
-// ── Modal: per-section compare and merge (push / pull) ────────────────────────
-// rows: buildComparison() rows; onApply({ push: key[], pull: key[], force: boolean })
+// ── Modal: per-section compare and merge (push / pull / three-way merge) ──────
+// rows: buildComparison() rows. onApply({ push: key[], pull: key[], merge: { [key]: text }, force })
 class MergeModal extends Modal {
     constructor(app, rows, { defaultKeys, auditState, onApply }) {
         super(app);
@@ -1389,6 +1461,7 @@ class MergeModal extends Modal {
             wrap.createEl('span', { text: ' Enforce write on non-EDIT audit (this operation only)' });
         }
 
+        const STATUS = { same: 'identical', local: 'changed in the note', remote: 'changed on PwnDoc', conflict: 'changed on both sides', unknown: 'differs (no sync base)' };
         const ui = this.rows.map(row => {
             const def = SECTION_DEFS.find(d => d.key === row.key);
             const box = contentEl.createEl('div');
@@ -1399,7 +1472,7 @@ class MergeModal extends Modal {
             check.disabled = !!def.readOnly || !row.changed;
             head.createEl('strong', { text: ` ${labelOf(def)} ` });
             head.createEl('small', {
-                text: !row.changed ? 'identical' : [def.readOnly ? 'read-only' : 'differs',
+                text: [def.readOnly && row.changed ? 'read-only' : STATUS[row.status],
                     row.localEmpty ? 'note empty' : '', row.remoteEmpty ? 'PwnDoc empty' : ''].filter(Boolean).join(' · '),
                 cls: 'pwndoc-meta',
             });
@@ -1407,6 +1480,10 @@ class MergeModal extends Modal {
             dir.style.marginLeft = '8px';
             dir.createEl('option', { value: 'push', text: 'note → PwnDoc' });
             dir.createEl('option', { value: 'pull', text: 'PwnDoc → note' });
+            if (row.merge) dir.createEl('option', { value: 'merge', text: 'merge both' });
+            dir.value = row.merge ? 'merge' : row.status === 'remote' ? 'pull' : 'push';
+
+            let area = null;
             if (row.changed) {
                 const det = box.createEl('details');
                 det.createEl('summary', { text: 'diff (PwnDoc → note)' });
@@ -1418,7 +1495,20 @@ class MergeModal extends Modal {
                     if (d.op === 'del') l.style.color = 'var(--text-error)';
                 }
             }
-            return { row, check, dir };
+            if (row.merge) {
+                area = box.createEl('textarea');
+                area.value = row.merge.text;
+                area.rows = 8;
+                area.style.cssText = 'width:100%;font-family:var(--font-monospace);font-size:0.8em;';
+                box.createEl('small', {
+                    text: row.merge.conflicts ? `${row.merge.conflicts} conflict(s): resolve the markers (<<<<<<< / ======= / >>>>>>>) before applying` : 'merged without conflicts, review before applying',
+                    cls: 'pwndoc-meta',
+                });
+                const sync = () => { area.style.display = dir.value === 'merge' ? '' : 'none'; };
+                dir.onchange = sync;
+                sync();
+            }
+            return { row, check, dir, area };
         });
 
         const bar = contentEl.createEl('div');
@@ -1432,13 +1522,16 @@ class MergeModal extends Modal {
             const picked = ui.filter(u => u.check.checked);
             const push = picked.filter(u => u.dir.value === 'push').map(u => u.row.key);
             const pull = picked.filter(u => u.dir.value === 'pull').map(u => u.row.key);
-            if (!push.length && !pull.length) { new Notice('PwnDoc Importer: nothing selected.'); return; }
-            if (push.length && this.auditState !== 'EDIT' && !forceBox?.checked) {
+            const merge = Object.fromEntries(picked.filter(u => u.dir.value === 'merge').map(u => [u.row.key, u.area.value]));
+            if (!push.length && !pull.length && !Object.keys(merge).length) { new Notice('PwnDoc Importer: nothing selected.'); return; }
+            const bad = Object.entries(merge).find(([, t]) => hasConflictMarkers(t));
+            if (bad) { new Notice(`PwnDoc Importer: resolve the conflict markers in "${labelOf(defOf(bad[0]))}" first.`); return; }
+            if ((push.length || Object.keys(merge).length) && this.auditState !== 'EDIT' && !forceBox?.checked) {
                 new Notice(`PwnDoc Importer: audit is ${this.auditState}, tick "Enforce" to push.`);
                 return;
             }
             this.close();
-            this.onApply({ push, pull, force: !!forceBox?.checked });
+            this.onApply({ push, pull, merge, force: !!forceBox?.checked });
         };
     }
 
@@ -1853,14 +1946,19 @@ class PwnDocImporterPlugin extends Plugin {
         try {
             ({ audit, finding } = await fetchFinding(ctx, auditId, findingId));
             noteMd = await this.app.vault.read(file);
-            rows = await buildComparison(ctx, noteMd, finding, SECTION_DEFS.map(d => d.key), ctx.noteInfo);
+            rows = await buildComparison(ctx, noteMd, finding, SECTION_DEFS.map(d => d.key), ctx.noteInfo, await loadBase(ctx.adapter, ctx.historyDir));
         } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); return; }
 
         new MergeModal(this.app, rows, {
             defaultKeys: DEFAULT_SYNC_SECTIONS,
             auditState: audit.state,
-            onApply: async ({ push, pull, force }) => {
+            onApply: async ({ push, pull, merge, force }) => {
                 try {
+                    if (Object.keys(merge).length) {
+                        const r = await applyMerged(ctx, { auditId, findingId, noteMd, merged: merge, snapshotFinding: finding, force });
+                        await this.app.vault.modify(file, r.noteMd);
+                        noteMd = r.noteMd;
+                    }
                     if (push.length) {
                         await pushSections(ctx, { auditId, findingId, noteMd, sections: push, snapshotFinding: finding, force });
                     }
@@ -1869,7 +1967,7 @@ class PwnDocImporterPlugin extends Plugin {
                         await this.app.vault.modify(file, r.noteMd);
                         await this.applyPullMeta(file, r.meta);
                     }
-                    new Notice(`PwnDoc Importer: pushed ${push.length}, pulled ${pull.length} section(s).`);
+                    new Notice(`PwnDoc Importer: pushed ${push.length}, pulled ${pull.length}, merged ${Object.keys(merge).length} section(s).`);
                 } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
             },
         }).open();
@@ -2078,6 +2176,6 @@ module.exports = PwnDocImporterPlugin;
 module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
-    isValidCvss31, cvssFrontmatter, localValue, labelOf, historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase,
+    classify, merge3, hasConflictMarkers, applyMerged, isValidCvss31, cvssFrontmatter, localValue, labelOf, historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase,
     AuditLockedError, assertEditable, findingHash, assertUnchanged, isEmptyValue, pushSections, pullSections,
     restoreRemotePatch, restoreLocal, buildRollbackComparison, rollbackSections };

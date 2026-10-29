@@ -595,3 +595,70 @@ test('pullSections returns title and CVSS as meta and leaves the note body alone
 test('labelOf names every section, including title and CVSS which have no heading alias', () => {
     assert.deepEqual(T.SECTION_DEFS.map(T.labelOf), ['Descrizione', 'Impatto', 'Evidenza', 'Assets', 'Remediation', 'References', 'Custom Fields', 'Title', 'CVSS vector']);
 });
+
+// ── three-way merge ───────────────────────────────────────────────────────────
+test('classify: same, local-only, remote-only, both, and no base', () => {
+    assert.equal(T.classify('x', 'x', 'x'), 'same');
+    assert.equal(T.classify('x', 'y', 'x'), 'local');
+    assert.equal(T.classify('x', 'x', 'y'), 'remote');
+    assert.equal(T.classify('x', 'y', 'z'), 'conflict');
+    assert.equal(T.classify('x', 'y', 'y'), 'same');
+    assert.equal(T.classify(undefined, 'y', 'z'), 'unknown');
+    assert.equal(T.classify(undefined, 'y', 'y'), 'same');
+});
+
+test('merge3 combines changes on different lines without conflicts', () => {
+    const r = T.merge3('a\nb\nc\nd\ne', 'a\nB\nc\nd\ne', 'a\nb\nc\nD\ne');
+    assert.deepEqual(r, { text: 'a\nB\nc\nD\ne', conflicts: 0 });
+});
+
+test('merge3 reports a conflict, with markers, when both sides change the same line differently', () => {
+    const r = T.merge3('a\nb\nc', 'a\nX\nc', 'a\nY\nc');
+    assert.equal(r.conflicts, 1);
+    assert.equal(r.text, 'a\n<<<<<<< local\nX\n=======\nY\n>>>>>>> pwndoc\nc');
+    assert.equal(T.hasConflictMarkers(r.text), true);
+});
+
+test('merge3 takes the only changed side and does not duplicate an identical change', () => {
+    assert.equal(T.merge3('a\nb', 'a\nB', 'a\nb').text, 'a\nB');
+    assert.equal(T.merge3('a\nb', 'a\nb', 'a\nB').text, 'a\nB');
+    assert.deepEqual(T.merge3('a\nb', 'a\nB', 'a\nB'), { text: 'a\nB', conflicts: 0 });
+});
+
+test('merge3 handles insertions and deletions against an empty base', () => {
+    assert.deepEqual(T.merge3('', 'x', ''), { text: 'x', conflicts: 0 });
+    assert.deepEqual(T.merge3('a\nb\nc', 'a\nc', 'a\nb\nc\nd'), { text: 'a\nc\nd', conflicts: 0 });
+});
+
+test('hasConflictMarkers only matches marker lines', () => {
+    assert.equal(T.hasConflictMarkers('a\n=======\nb'), true);
+    assert.equal(T.hasConflictMarkers('a = b\nx ======= y'), false);
+});
+
+test('buildComparison classifies sections against the stored base', async () => {
+    const note = '## Evidenza\n\nbase poc\n\n## Descrizione\n\nlocal desc\n';
+    const base = { sections: { poc: 'base poc', description: 'remote desc' } };
+    const rows = await T.buildComparison(cmpCtx, note, FINDING, ['poc', 'description', 'remediation'], {}, base);
+    const by = Object.fromEntries(rows.map(r => [r.key, r.status]));
+    assert.equal(by.poc, 'remote');        // note still equals the base, PwnDoc moved on
+    assert.equal(by.description, 'local'); // note changed, PwnDoc still equals the base
+    assert.equal(by.remediation, 'unknown'); // no base for this section: two-way
+});
+
+test('applyMerged pushes the merged text to PwnDoc once and returns the note with it, recording a merge entry with the original note', async () => {
+    const ctx = syncCtx({ remote: { poc: '<p>a\nb\nc\nd\ne</p>' } });
+    const noteMd = '## Evidenza\n\na\nB\nc\nd\ne\n';
+    const r = await T.applyMerged(ctx, { auditId: AID, findingId: FID, noteMd, merged: { poc: 'a\nB\nc\nD\ne' }, snapshotFinding: clone(ctx.finding), force: false });
+    assert.equal(ctx.log.puts.length, 1);
+    assert.equal(ctx.finding.poc, '<p>a\nB\nc\nD\ne</p>');
+    assert.equal(T.parseSections(r.noteMd).poc.text, 'a\nB\nc\nD\ne');
+    const h = (await T.listHistory(ctx.hist, ctx.historyDir))[0];
+    assert.equal(h.op, 'merge');
+    assert.equal(h.localBefore, noteMd);
+});
+
+test('applyMerged refuses text that still contains conflict markers', async () => {
+    const ctx = syncCtx();
+    await assert.rejects(T.applyMerged(ctx, { auditId: AID, findingId: FID, noteMd: NOTE_ONLY_POC, merged: { poc: 'a\n<<<<<<< local\nx\n=======\ny\n>>>>>>> pwndoc' }, snapshotFinding: clone(ctx.finding), force: false }), /conflict/i);
+    assert.equal(ctx.log.puts.length, 0);
+});
