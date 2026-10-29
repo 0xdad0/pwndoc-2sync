@@ -1,6 +1,6 @@
 'use strict';
 
-const { Plugin, PluginSettingTab, Setting, FuzzySuggestModal, SuggestModal, Modal, Notice, normalizePath } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, FuzzySuggestModal, SuggestModal, Modal, Notice, normalizePath, SecretComponent } = require('obsidian');
 
 // ── CSV Parser ────────────────────────────────────────────────────────────────
 function parseCSV(text) {
@@ -237,6 +237,20 @@ function flattenVulnsFromApi(vulns, cfLabels = {}) {
     return rows;
 }
 
+// ── API password in Obsidian secretStorage ────────────────────────────────────
+const SECRET_ID = 'pwndoc-importer-api-password';
+
+// Move a legacy plaintext password out of settings into secretStorage
+function migratePassword(settings, secretStorage) {
+    const { apiPassword, ...rest } = settings;
+    if (apiPassword) secretStorage.setSecret(rest.apiPasswordSecret || SECRET_ID, apiPassword);
+    return rest;
+}
+
+function getApiPassword(app, settings) {
+    return app.secretStorage.getSecret(settings.apiPasswordSecret || SECRET_ID) ?? '';
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────────
 const DEFAULT_SETTINGS = {
     csvPath:         '',
@@ -247,7 +261,7 @@ const DEFAULT_SETTINGS = {
     cweFieldId:      'cf_63ab317fafe66f0011b89881',
     apiUrl:          '',
     apiUsername:     '',
-    apiPassword:     '',
+    apiPasswordSecret: SECRET_ID,
     apiIgnoreSsl:    false,
     csvOutputFolder: '',
     debugMode:       false,
@@ -444,7 +458,7 @@ class ApiCredentialsModal extends Modal {
 
         const passInput = mkRow('Password', wrap => {
             const el = wrap.createEl('input', { type: 'password' });
-            el.value = s.apiPassword || '';
+            el.value = getApiPassword(this.app, s);
             el.style.cssText = 'width:100%;';
             return el;
         });
@@ -627,11 +641,10 @@ class PwnDocSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Password')
-            .addText(t => {
-                t.inputEl.type = 'password';
-                t.setValue(this.plugin.settings.apiPassword)
-                 .onChange(async v => { this.plugin.settings.apiPassword = v; await this.plugin.saveSettings(); });
-            });
+            .setDesc('Stored in Obsidian secret storage, not in the plugin data file.')
+            .addComponent(el => new SecretComponent(this.app, el)
+                .setValue(this.plugin.settings.apiPasswordSecret)
+                .onChange(async v => { this.plugin.settings.apiPasswordSecret = v; await this.plugin.saveSettings(); }));
 
         new Setting(containerEl)
             .setName('Ignore SSL certificate errors')
@@ -770,6 +783,10 @@ class PwnDocImporterPlugin extends Plugin {
 
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        if ('apiPassword' in this.settings) {
+            this.settings = migratePassword(this.settings, this.app.secretStorage);
+            await this.saveSettings();
+        }
     }
     async saveSettings() { await this.saveData(this.settings); }
 
@@ -801,11 +818,12 @@ class PwnDocImporterPlugin extends Plugin {
     // Quick import — single command driven by the default source/language settings
     quickImport() {
         if (this.settings.quickImportSource === 'api') {
-            if (!this.settings.apiUrl || !this.settings.apiUsername || !this.settings.apiPassword) {
+            if (!this.settings.apiUrl || !this.settings.apiUsername || !getApiPassword(this.app, this.settings)) {
                 new Notice('PwnDoc Importer: save API credentials in Settings to use the quick API import.');
                 return;
             }
-            const { apiUrl: url, apiUsername: username, apiPassword: password, apiIgnoreSsl: ignoreSsl } = this.settings;
+            const { apiUrl: url, apiUsername: username, apiIgnoreSsl: ignoreSsl } = this.settings;
+            const password = getApiPassword(this.app, this.settings);
             this.fetchFromApi({ url, username, password, ignoreSsl, save: false, quick: true });
         } else {
             this.openSearchModal({ quick: true });
@@ -846,7 +864,7 @@ class PwnDocImporterPlugin extends Plugin {
         if (save) {
             this.settings.apiUrl      = url;
             this.settings.apiUsername = username;
-            this.settings.apiPassword = password;
+            this.app.secretStorage.setSecret(this.settings.apiPasswordSecret || SECRET_ID, password);
             this.settings.apiIgnoreSsl = ignoreSsl;
             await this.saveSettings();
         }
@@ -1061,4 +1079,4 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { pwndocApi };
+module.exports.__test = { pwndocApi, migratePassword, SECRET_ID };

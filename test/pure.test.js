@@ -36,3 +36,20 @@ test('pwndocApi rejects with HTTP status on 500', async () => {
     await assert.rejects(T.pwndocApi(base, 'T', 'GET', '/api/x'), /HTTP 500/);
     s.closeAllConnections(); s.close();
 });
+
+test('migratePassword moves plaintext password into secretStorage and drops it from settings', () => {
+    const calls = [];
+    const store = { setSecret: (id, v) => calls.push([id, v]) };
+    const out = T.migratePassword({ apiUrl: 'u', apiPassword: 'x' }, store);
+    assert.deepEqual(calls, [[T.SECRET_ID, 'x']]);
+    assert.equal('apiPassword' in out, false);
+    assert.equal(out.apiUrl, 'u');
+});
+
+test('migratePassword leaves settings alone when no plaintext password', () => {
+    const calls = [];
+    const store = { setSecret: (id, v) => calls.push([id, v]) };
+    const out = T.migratePassword({ apiPassword: '' }, store);
+    assert.deepEqual(calls, []);
+    assert.equal('apiPassword' in out, false);
+});
