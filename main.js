@@ -89,7 +89,7 @@ const SECTION_DEFS = [
     { key: 'scope',        field: 'scope',        kind: 'text',   aliases: ['Assets'] },
     { key: 'remediation',  field: 'remediation',  kind: 'html',   aliases: ['Remediation'] },
     { key: 'references',   field: 'references',   kind: 'list',   aliases: ['References'] },
-    { key: 'customFields', field: 'customFields', kind: 'custom', aliases: ['Custom Fields'] },
+    { key: 'customFields', field: 'customFields', kind: 'custom', aliases: ['Custom Fields'], readOnly: true }, // shown in the diff, never pushed or pulled
 ];
 const DEFAULT_SYNC_SECTIONS = ['poc'];
 const ALIAS_TO_KEY = new Map(SECTION_DEFS.flatMap(d => d.aliases.map(a => [a.toLowerCase(), d.key])));
@@ -408,6 +408,7 @@ async function recordHistory(adapter, dir, entry, limit) {
     const id = `${entry.ts.replace(/[:.]/g, '-')}-${entry.op}-${Math.random().toString(16).slice(2, 6)}`;
     await adapter.write(`${dir}/${id}.json`, JSON.stringify({ ...entry, id }, null, 1));
     for (const f of pruneNames(await historyFiles(adapter, dir), limit)) await adapter.remove(f);
+    return id;
 }
 
 // Newest first; unreadable files are skipped
@@ -427,6 +428,119 @@ async function saveBase(adapter, dir, base) {
     const prev = await loadBase(adapter, dir);
     if (!(await adapter.exists(dir))) await adapter.mkdir(dir);
     await adapter.write(`${dir}/${BASE_FILE}`, JSON.stringify({ ts: base.ts, sections: { ...prev?.sections, ...base.sections } }, null, 1));
+}
+
+// ── Push / pull pipeline ──────────────────────────────────────────────────────
+class AuditLockedError extends Error {
+    constructor(state) {
+        super(`audit is in state ${state}, not EDIT (tick "Enforce" to write anyway)`);
+        this.state = state;
+    }
+}
+
+function assertEditable(audit, force) {
+    if (audit.state !== 'EDIT' && !force) throw new AuditLockedError(audit.state);
+}
+
+// The finding has no updatedAt, so "unchanged since compare" means the selected fields hash the same
+function findingHash(finding, sections) {
+    const fields = sections.map(k => SECTION_DEFS.find(d => d.key === k).field).sort();
+    return require('crypto').createHash('sha256').update(JSON.stringify(fields.map(f => [f, finding[f] ?? null]))).digest('hex');
+}
+
+function assertUnchanged(snapshotHash, fresh, sections) {
+    if (findingHash(fresh, sections) !== snapshotHash) throw new Error('finding changed on PwnDoc since compare');
+}
+
+// Empty = no text and no image (an evidence section that is only a screenshot is not empty)
+function isEmptyValue(v) {
+    if (Array.isArray(v)) return v.length === 0;
+    const s = String(v ?? '');
+    return s.replace(/<(?!img\b)[^>]*>/gi, '').trim() === '';
+}
+
+const defOf = key => SECTION_DEFS.find(d => d.key === key);
+
+async function localToRemote(ctx, auditId, def, text) {
+    if (def.kind === 'html') return text === '' ? '' : ctx.mdToHtml(await tokenizeImages(ctx, auditId, text));
+    if (def.kind === 'list') return listLines(text).split('\n').filter(Boolean);
+    return text.trim();
+}
+
+async function remoteToLocal(ctx, def, value) {
+    if (def.kind === 'html') return pullImages(ctx, ctx.htmlToMd(value || ''), ctx.attachmentsFolder);
+    if (def.kind === 'list') return (value || []).map(s => `- ${s}`).join('\n');
+    return String(value ?? '');
+}
+
+async function comparisonForm(ctx, def, text) {
+    if (def.kind === 'html') return ctx.normalize(text);
+    if (def.kind === 'list') return listLines(text);
+    return text.trim();
+}
+
+async function fetchFinding(ctx, auditId, findingId) {
+    const audit = await ctx.api('GET', `/api/audits/${auditId}`);
+    const finding = audit.findings?.find(f => f._id === findingId);
+    if (!finding) throw new Error('finding not found in the audit');
+    return { audit, finding };
+}
+
+// ctx: see Plugin.syncCtx. Writes PwnDoc: only the patch of the selected fields (PUT merges), after the
+// state guard, the changed-since-compare check and a history entry. Nothing is written if any step throws.
+async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapshotFinding, force }) {
+    const defs = sections.map(defOf);
+    const ro = defs.find(d => d.readOnly);
+    if (ro) throw new Error(`section ${ro.key} is read-only`);
+    const { audit, finding: fresh } = await fetchFinding(ctx, auditId, findingId);
+    assertEditable(audit, force);
+    assertUnchanged(findingHash(snapshotFinding, sections), fresh, sections);
+
+    const secs = parseSections(noteMd);
+    const patch = {};
+    const baseSections = {};
+    for (const def of defs) {
+        const text = secs[def.key]?.text || '';
+        if (text === '' && !isEmptyValue(fresh[def.field]) && !(await ctx.confirmEmpty(def.key, 'push'))) {
+            throw new Error(`local section ${def.key} is empty, refusing to blank it on PwnDoc`);
+        }
+        patch[def.field] = await localToRemote(ctx, auditId, def, text);
+        baseSections[def.key] = await comparisonForm(ctx, def, text);
+    }
+    const ts = new Date().toISOString();
+    const entryId = await recordHistory(ctx.adapter, ctx.historyDir, {
+        ts, op: 'push', forced: !!force && audit.state !== 'EDIT', auditId, findingId, notePath: ctx.notePath,
+        sections, remoteBefore: fresh, localBefore: noteMd,
+    }, ctx.historyLimit);
+    await ctx.api('PUT', `/api/audits/${auditId}/findings/${findingId}`, { body: patch });
+    await saveBase(ctx.adapter, ctx.historyDir, { ts, sections: baseSections });
+    return { patch, entryId };
+}
+
+// Local only: returns the new note text, the caller writes it
+async function pullSections(ctx, { auditId, findingId, noteMd, sections }) {
+    const defs = sections.map(defOf);
+    const ro = defs.find(d => d.readOnly);
+    if (ro) throw new Error(`section ${ro.key} is read-only`);
+    const { finding: fresh } = await fetchFinding(ctx, auditId, findingId);
+    const secs = parseSections(noteMd);
+    let md = noteMd;
+    const baseSections = {};
+    for (const def of defs) {
+        if (isEmptyValue(fresh[def.field]) && (secs[def.key]?.text || '') !== '' && !(await ctx.confirmEmpty(def.key, 'pull'))) {
+            throw new Error(`PwnDoc section ${def.key} is empty, refusing to blank it in the note`);
+        }
+        const text = await remoteToLocal(ctx, def, fresh[def.field]);
+        md = replaceSection(md, def.key, text);
+        baseSections[def.key] = await comparisonForm(ctx, def, text);
+    }
+    const ts = new Date().toISOString();
+    const entryId = await recordHistory(ctx.adapter, ctx.historyDir, {
+        ts, op: 'pull', forced: false, auditId, findingId, notePath: ctx.notePath,
+        sections, remoteBefore: fresh, localBefore: noteMd,
+    }, ctx.historyLimit);
+    await saveBase(ctx.adapter, ctx.historyDir, { ts, sections: baseSections });
+    return { noteMd: md, entryId };
 }
 
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
@@ -1127,6 +1241,108 @@ class FindingPickModal extends FuzzySuggestModal {
     onChooseItem(f) { this.onChoose(f); }
 }
 
+// ── Modal: yes/no confirmation ────────────────────────────────────────────────
+class ConfirmModal extends Modal {
+    constructor(app, message, onAnswer) {
+        super(app);
+        this.message = message;
+        this.onAnswer = onAnswer; // (boolean) => void
+        this.answered = false;
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl('p', { text: this.message });
+        const answer = v => { this.answered = true; this.close(); this.onAnswer(v); };
+        contentEl.createEl('button', { text: 'Yes, continue', cls: 'mod-warning' }).onclick = () => answer(true);
+        const no = contentEl.createEl('button', { text: 'Cancel' });
+        no.style.marginLeft = '8px';
+        no.onclick = () => answer(false);
+    }
+    onClose() { this.contentEl.empty(); if (!this.answered) this.onAnswer(false); }
+}
+
+// ── Modal: per-section compare and merge (push / pull) ────────────────────────
+// rows: buildComparison() rows; onApply({ push: key[], pull: key[], force: boolean })
+class MergeModal extends Modal {
+    constructor(app, rows, { defaultKeys, auditState, onApply }) {
+        super(app);
+        this.rows = rows;
+        this.defaultKeys = defaultKeys;
+        this.auditState = auditState;
+        this.onApply = onApply;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl('h3', { text: 'Compare with PwnDoc' });
+
+        let forceBox = null;
+        if (this.auditState !== 'EDIT') {
+            const warn = contentEl.createEl('div');
+            warn.style.cssText = 'padding:6px 8px;margin-bottom:8px;border:1px solid var(--text-error);border-radius:4px;';
+            warn.createEl('div', { text: `Audit state is ${this.auditState}: writing to PwnDoc is blocked.` });
+            const wrap = warn.createEl('label');
+            forceBox = wrap.createEl('input', { type: 'checkbox' });
+            wrap.createEl('span', { text: ' Enforce write on non-EDIT audit (this operation only)' });
+        }
+
+        const ui = this.rows.map(row => {
+            const def = SECTION_DEFS.find(d => d.key === row.key);
+            const box = contentEl.createEl('div');
+            box.style.cssText = 'margin-bottom:8px;';
+            const head = box.createEl('label');
+            const check = head.createEl('input', { type: 'checkbox' });
+            check.checked = !def.readOnly && row.changed && this.defaultKeys.includes(row.key);
+            check.disabled = !!def.readOnly || !row.changed;
+            head.createEl('strong', { text: ` ${def.aliases[0]} ` });
+            head.createEl('small', {
+                text: !row.changed ? 'identical' : [def.readOnly ? 'read-only' : 'differs',
+                    row.localEmpty ? 'note empty' : '', row.remoteEmpty ? 'PwnDoc empty' : ''].filter(Boolean).join(' · '),
+                cls: 'pwndoc-meta',
+            });
+            const dir = head.createEl('select');
+            dir.style.marginLeft = '8px';
+            dir.createEl('option', { value: 'push', text: 'note → PwnDoc' });
+            dir.createEl('option', { value: 'pull', text: 'PwnDoc → note' });
+            if (row.changed) {
+                const det = box.createEl('details');
+                det.createEl('summary', { text: 'diff (PwnDoc → note)' });
+                const pre = det.createEl('pre');
+                pre.style.cssText = 'max-height:200px;overflow:auto;font-size:0.8em;';
+                for (const d of row.diff) {
+                    const l = pre.createEl('div', { text: `${{ eq: '  ', add: '+ ', del: '- ' }[d.op]}${d.line}` });
+                    if (d.op === 'add') l.style.color = 'var(--text-success)';
+                    if (d.op === 'del') l.style.color = 'var(--text-error)';
+                }
+            }
+            return { row, check, dir };
+        });
+
+        const bar = contentEl.createEl('div');
+        bar.style.cssText = 'display:flex;gap:8px;margin-top:10px;';
+        const setAll = v => ui.forEach(u => { if (!u.check.disabled) u.check.checked = v; });
+        bar.createEl('button', { text: 'All' }).onclick = () => setAll(true);
+        bar.createEl('button', { text: 'None' }).onclick = () => setAll(false);
+        const apply = bar.createEl('button', { text: 'Apply', cls: 'mod-cta' });
+        apply.style.marginLeft = 'auto';
+        apply.onclick = () => {
+            const picked = ui.filter(u => u.check.checked);
+            const push = picked.filter(u => u.dir.value === 'push').map(u => u.row.key);
+            const pull = picked.filter(u => u.dir.value === 'pull').map(u => u.row.key);
+            if (!push.length && !pull.length) { new Notice('PwnDoc Importer: nothing selected.'); return; }
+            if (push.length && this.auditState !== 'EDIT' && !forceBox?.checked) {
+                new Notice(`PwnDoc Importer: audit is ${this.auditState}, tick "Enforce" to push.`);
+                return;
+            }
+            this.close();
+            this.onApply({ push, pull, force: !!forceBox?.checked });
+        };
+    }
+
+    onClose() { this.contentEl.empty(); }
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 class PwnDocImporterPlugin extends Plugin {
     async onload() {
@@ -1163,6 +1379,11 @@ class PwnDocImporterPlugin extends Plugin {
             id: 'associate-note-to-finding',
             name: 'Associate note to PwnDoc finding',
             callback: () => this.associateNote(),
+        });
+        this.addCommand({
+            id: 'compare-with-pwndoc',
+            name: 'Compare with PwnDoc and merge sections',
+            callback: () => this.compareWithPwndoc(),
         });
         this.registerEvent(this.app.vault.on('rename', async (file, oldPath) => {
             if (file.children === undefined) return; // folders only
@@ -1395,6 +1616,77 @@ class PwnDocImporterPlugin extends Plugin {
         }).open();
     }
 
+    // ── Engagement sync: compare / merge ─────────────────────────────────────────
+
+    // Everything the push/pull pipeline needs from the Obsidian side
+    syncCtx(file, findingId) {
+        const app = this.app;
+        const adapter = app.vault.adapter;
+        return {
+            notePath: file.path,
+            api: (m, p, o) => this.api(m, p, o),
+            mdToHtml: md => mdToHtml(app, md),
+            htmlToMd,
+            normalize: md => normalizeMd(app, md),
+            cfLabels: this.cfLabels || {},
+            resolvePath: src => (app.metadataCache.getFirstLinkpathDest(src, file.path)
+                ?? app.vault.getAbstractFileByPath(normalizePath(`${parentDir(file.path)}/${src}`)))?.path ?? null,
+            readBinary: async p => Buffer.from(await adapter.readBinary(p)),
+            imageCache: this.settings.imageCache,
+            save: () => this.saveSettings(),
+            exists: p => adapter.exists(p),
+            writeBinary: async (p, buf) => {
+                const dir = parentDir(p);
+                if (dir && !(await adapter.exists(dir))) await adapter.mkdir(dir);
+                await adapter.writeBinary(p, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+            },
+            adapter,
+            historyDir: historyDir(this.manifest.dir, findingId),
+            historyLimit: this.settings.historyLimit,
+            attachmentsFolder: this.settings.attachmentsFolder,
+            confirmEmpty: (key, direction) => new Promise(resolve => new ConfirmModal(app,
+                direction === 'push'
+                    ? `The "${defOf(key).aliases[0]}" section of the note is empty but PwnDoc has content. Overwrite PwnDoc with an empty section?`
+                    : `PwnDoc has no content in "${defOf(key).aliases[0]}" but the note does. Overwrite the note section with an empty one?`,
+                resolve).open()),
+        };
+    }
+
+    async compareWithPwndoc() {
+        const file = this.app.workspace.getActiveFile();
+        const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
+        if (!file) { new Notice('PwnDoc Importer: open a note first.'); return; }
+        if (!fm?.pwndoc_finding_id) { new Notice('PwnDoc Importer: associate this note to a finding first.'); return; }
+        const auditId = resolveAuditId(file.path, fm, this.settings.folderAudits);
+        const findingId = fm.pwndoc_finding_id;
+        if (!auditId) { new Notice('PwnDoc Importer: no engagement associated to this note or its folders.'); return; }
+
+        let audit, finding, rows, noteMd;
+        const ctx = this.syncCtx(file, findingId);
+        try {
+            ({ audit, finding } = await fetchFinding(ctx, auditId, findingId));
+            noteMd = await this.app.vault.read(file);
+            rows = await buildComparison(ctx, noteMd, finding, SECTION_DEFS.map(d => d.key));
+        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); return; }
+
+        new MergeModal(this.app, rows, {
+            defaultKeys: DEFAULT_SYNC_SECTIONS,
+            auditState: audit.state,
+            onApply: async ({ push, pull, force }) => {
+                try {
+                    if (push.length) {
+                        await pushSections(ctx, { auditId, findingId, noteMd, sections: push, snapshotFinding: finding, force });
+                    }
+                    if (pull.length) {
+                        const r = await pullSections(ctx, { auditId, findingId, noteMd: await this.app.vault.read(file), sections: pull });
+                        await this.app.vault.modify(file, r.noteMd);
+                    }
+                    new Notice(`PwnDoc Importer: pushed ${push.length}, pulled ${pull.length} section(s).`);
+                } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+            },
+        }).open();
+    }
+
     // Step 2 — ask VT or M
     askPrefix(vuln) {
         new PrefixModal(this.app, prefix => this.askFolder(vuln, prefix)).open();
@@ -1547,4 +1839,5 @@ module.exports = PwnDocImporterPlugin;
 module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
-    historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase };
+    historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase,
+    AuditLockedError, assertEditable, findingHash, assertUnchanged, isEmptyValue, pushSections, pullSections };

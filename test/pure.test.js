@@ -360,3 +360,123 @@ test('loadBase is null without a file; saveBase merges sections across calls', a
     assert.deepEqual(b.sections, { poc: 'p1', description: 'd1' });
     assert.equal(b.ts, '2');
 });
+
+// ── push / pull pipeline ──────────────────────────────────────────────────────
+const AID = 'A'.repeat(24), FID = 'F'.repeat(24);
+function syncCtx({ state = 'EDIT', remote = {}, confirmEmpty = async () => true, files = {} } = {}) {
+    const finding = { _id: FID, title: 'T', description: '<p>remote desc</p>', observation: '<p>remote obs</p>', poc: '<p>remote poc</p>',
+        scope: 'a1', remediation: '<p>rem</p>', references: ['http://x'], cvssv3: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H', customFields: [], ...remote };
+    const log = { puts: [], posts: [] };
+    const hist = memAdapter();
+    const ctx = {
+        log, hist, finding,
+        notePath: 'n.md',
+        api: async (method, path, opts) => {
+            if (method === 'GET' && path === `/api/audits/${AID}`) return { _id: AID, state, findings: [finding] };
+            if (method === 'PUT') { log.puts.push({ path, body: opts.body }); Object.assign(finding, opts.body); return 'ok'; }
+            if (method === 'POST') { log.posts.push(opts.body.name); return { _id: 'b'.repeat(23) + log.posts.length }; }
+            if (method === 'GET' && path.startsWith('/api/images/')) return { value: 'data:image/png;base64,' + Buffer.from('PNG').toString('base64') };
+            throw new Error(`unexpected ${method} ${path}`);
+        },
+        mdToHtml: async md => T.expandImgTokens(md.split(/\n\n+/).map(p => `<p>${p}</p>`).join('')),
+        htmlToMd: html => html.replace(/<\/p><p>/g, '\n\n').replace(/<[^>]+>/g, '').trim(),
+        normalize: async md => md.trim(),
+        cfLabels: {},
+        resolvePath: s => (s in files ? s : null),
+        readBinary: async p => files[p],
+        imageCache: {}, save: async () => {},
+        exists: async () => false, writeBinary: async () => {},
+        adapter: hist, historyDir: 'h/F', historyLimit: 50, attachmentsFolder: 'attachments',
+        confirmEmpty,
+    };
+    return ctx;
+}
+const NOTE_ONLY_POC = '## Descrizione\n\n\n## Impatto\n\n\n## Evidenza\n\nlocal poc\n\n## Assets\n\n\n## Remediation\n\n\n';
+const clone = o => JSON.parse(JSON.stringify(o));
+const pushArgs = (ctx, extra) => ({ auditId: AID, findingId: FID, noteMd: NOTE_ONLY_POC, sections: ['poc'], snapshotFinding: clone(ctx.finding), force: false, ...extra });
+
+test('findingHash only covers the selected sections', () => {
+    const f = { poc: 'a', description: 'd' };
+    assert.equal(T.findingHash(f, ['poc']), T.findingHash({ ...f, description: 'changed' }, ['poc']));
+    assert.notEqual(T.findingHash(f, ['poc']), T.findingHash({ ...f, poc: 'b' }, ['poc']));
+});
+
+test('assertEditable blocks non-EDIT audits unless forced', () => {
+    assert.throws(() => T.assertEditable({ state: 'REVIEW' }, false), /REVIEW/);
+    T.assertEditable({ state: 'REVIEW' }, true);
+    T.assertEditable({ state: 'EDIT' }, false);
+});
+
+test('pushSections on a populated PwnDoc finding with only Evidenza written locally sends only the PoC patch', async () => {
+    const ctx = syncCtx();
+    const r = await T.pushSections(ctx, pushArgs(ctx));
+    assert.deepEqual(ctx.log.puts.map(p => p.body), [{ poc: '<p>local poc</p>' }]);
+    assert.equal(ctx.finding.description, '<p>remote desc</p>');
+    const h = await T.listHistory(ctx.hist, ctx.historyDir);
+    assert.equal(h[0].op, 'push');
+    assert.equal(h[0].remoteBefore.poc, '<p>remote poc</p>');
+    assert.equal(h[0].localBefore, NOTE_ONLY_POC);
+    assert.equal((await T.loadBase(ctx.hist, ctx.historyDir)).sections.poc, 'local poc');
+    assert.equal(r.entryId, h[0].id);
+});
+
+test('pushSections refuses to blank a populated remote section unless the user confirms', async () => {
+    const ctx = syncCtx({ confirmEmpty: async () => false });
+    await assert.rejects(T.pushSections(ctx, pushArgs(ctx, { sections: ['poc', 'description'] })), /empty/i);
+    assert.equal(ctx.log.puts.length, 0);
+    assert.equal((await T.listHistory(ctx.hist, ctx.historyDir)).length, 0);
+});
+
+test('pushSections aborts when a selected field changed on PwnDoc after the compare, but not when an unselected one did', async () => {
+    const ctx = syncCtx();
+    const snap = clone(ctx.finding);
+    ctx.finding.description = '<p>edited by someone else</p>';
+    await T.pushSections(ctx, pushArgs(ctx, { snapshotFinding: snap }));
+    assert.equal(ctx.log.puts.length, 1);
+    ctx.finding.poc = '<p>edited too</p>';
+    await assert.rejects(T.pushSections(ctx, pushArgs(ctx, { snapshotFinding: snap })), /changed on PwnDoc/);
+    assert.equal(ctx.log.puts.length, 1);
+});
+
+test('pushSections is blocked on a REVIEW audit and goes through with force, recording forced', async () => {
+    const ctx = syncCtx({ state: 'REVIEW' });
+    await assert.rejects(T.pushSections(ctx, pushArgs(ctx)), /REVIEW/);
+    assert.equal(ctx.log.puts.length, 0);
+    await T.pushSections(ctx, pushArgs(ctx, { force: true }));
+    assert.equal(ctx.log.puts.length, 1);
+    assert.equal((await T.listHistory(ctx.hist, ctx.historyDir))[0].forced, true);
+});
+
+test('pushSections uploads images as tokens and aborts before any PUT when an image is missing', async () => {
+    const ok = syncCtx({ files: { 'a.png': Buffer.from('PNGDATA') } });
+    await T.pushSections(ok, pushArgs(ok, { noteMd: '## Evidenza\n\n![Figura 1](a.png)\n' }));
+    assert.match(ok.log.puts[0].body.poc, /<img src="b+1" alt="Figura 1">/);
+    const bad = syncCtx();
+    await assert.rejects(T.pushSections(bad, pushArgs(bad, { noteMd: '## Evidenza\n\n![x](gone.png)\n' })), /missing image: gone\.png/);
+    assert.equal(bad.log.puts.length, 0);
+    assert.equal((await T.listHistory(bad.hist, bad.historyDir)).length, 0);
+});
+
+test('pushSections refuses read-only sections', async () => {
+    const ctx = syncCtx();
+    await assert.rejects(T.pushSections(ctx, pushArgs(ctx, { sections: ['customFields'] })), /read-only/);
+});
+
+test('pullSections fills only the requested section of a note that only had Evidenza, records history and base', async () => {
+    const ctx = syncCtx({ remote: { poc: `<p>pulled</p><p><img src="${'c'.repeat(24)}" alt="F1"></p>` } });
+    const note = '## Descrizione\n\nmine\n\n## Evidenza\n\n\n## Assets\n\n';
+    ctx.htmlToMd = html => html.replace(/<img src="([^"]+)" alt="([^"]*)">/g, '![$2]($1)').replace(/<\/p><p>/g, '\n\n').replace(/<[^>]+>/g, '').trim();
+    const r = await T.pullSections(ctx, { auditId: AID, findingId: FID, noteMd: note, sections: ['poc'], force: false });
+    const secs = T.parseSections(r.noteMd);
+    assert.equal(secs.description.text, 'mine');
+    assert.match(secs.poc.text, /^pulled\n\n!\[F1\]\(attachments\/c+\.png\)$/);
+    const h = await T.listHistory(ctx.hist, ctx.historyDir);
+    assert.equal(h[0].op, 'pull');
+    assert.equal(h[0].localBefore, note);
+    assert.ok((await T.loadBase(ctx.hist, ctx.historyDir)).sections.poc);
+});
+
+test('pullSections refuses to blank a populated local section when PwnDoc has none, unless confirmed', async () => {
+    const ctx = syncCtx({ remote: { poc: '' }, confirmEmpty: async () => false });
+    await assert.rejects(T.pullSections(ctx, { auditId: AID, findingId: FID, noteMd: '## Evidenza\n\nmy evidence\n', sections: ['poc'], force: false }), /empty/i);
+});
