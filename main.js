@@ -543,6 +543,70 @@ async function pullSections(ctx, { auditId, findingId, noteMd, sections }) {
     return { noteMd: md, entryId };
 }
 
+// ── Rollback ──────────────────────────────────────────────────────────────────
+// Patch that puts the snapshot values of the given sections back on PwnDoc
+function restoreRemotePatch(snapshotFinding, sections) {
+    const patch = {};
+    for (const key of sections) {
+        const def = defOf(key);
+        if (def.readOnly) throw new Error(`section ${key} is read-only`);
+        patch[def.field] = snapshotFinding?.[def.field] ?? (def.kind === 'list' ? [] : '');
+    }
+    return patch;
+}
+
+function restoreLocal(noteMd, snapshotMd, sections) {
+    const snap = parseSections(snapshotMd);
+    return sections.reduce((md, key) => replaceSection(md, key, snap[key]?.text || ''), noteMd);
+}
+
+async function remoteForm(ctx, def, value) {
+    if (def.kind === 'html') return ctx.normalize(ctx.htmlToMd(value || ''));
+    if (def.kind === 'list') return (value || []).map(s => s.trim()).filter(Boolean).join('\n');
+    return String(value ?? '').trim();
+}
+
+// Current state vs the snapshot of a history entry, per section (side: 'remote' | 'local')
+async function buildRollbackComparison(ctx, entry, side, currentFinding, currentNoteMd, keys) {
+    const rows = [];
+    for (const key of keys) {
+        const def = defOf(key);
+        let cur, snap;
+        if (side === 'remote') {
+            cur = await remoteForm(ctx, def, currentFinding?.[def.field]);
+            snap = await remoteForm(ctx, def, entry.remoteBefore?.[def.field]);
+        } else {
+            cur = await comparisonForm(ctx, def, parseSections(currentNoteMd)[key]?.text || '');
+            snap = await comparisonForm(ctx, def, parseSections(entry.localBefore || '')[key]?.text || '');
+        }
+        rows.push({ key, current: cur, snapshot: snap, changed: cur !== snap, diff: lineDiff(cur, snap) });
+    }
+    return rows;
+}
+
+// Restore the sections of a history entry on PwnDoc (side 'remote', state guard applies) or in the note
+// (side 'local', returns the new text). The rollback is itself recorded, so it can be rolled back.
+async function rollbackSections(ctx, { entry, side, sections, noteMd, auditId, findingId, force, snapshotFinding }) {
+    const ts = new Date().toISOString();
+    if (side === 'local') {
+        const newMd = restoreLocal(noteMd, entry.localBefore || '', sections);
+        const entryId = await recordHistory(ctx.adapter, ctx.historyDir, {
+            ts, op: 'rollback', forced: false, auditId, findingId, notePath: ctx.notePath, sections, remoteBefore: null, localBefore: noteMd,
+        }, ctx.historyLimit);
+        return { noteMd: newMd, entryId };
+    }
+    const patch = restoreRemotePatch(entry.remoteBefore, sections);
+    const { audit, finding: fresh } = await fetchFinding(ctx, auditId, findingId);
+    assertEditable(audit, force);
+    if (snapshotFinding) assertUnchanged(findingHash(snapshotFinding, sections), fresh, sections);
+    const entryId = await recordHistory(ctx.adapter, ctx.historyDir, {
+        ts, op: 'rollback', forced: !!force && audit.state !== 'EDIT', auditId, findingId, notePath: ctx.notePath,
+        sections, remoteBefore: fresh, localBefore: noteMd,
+    }, ctx.historyLimit);
+    await ctx.api('PUT', `/api/audits/${auditId}/findings/${findingId}`, { body: patch });
+    return { entryId };
+}
+
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
 async function readFilePath(app, filePath) {
     if (/^([A-Za-z]:[\\/]|\/)/.test(filePath)) {
@@ -1343,6 +1407,85 @@ class MergeModal extends Modal {
     onClose() { this.contentEl.empty(); }
 }
 
+// ── Modal: pick a history entry, then where to restore it ─────────────────────
+class HistoryModal extends SuggestModal {
+    constructor(app, entries, onChoose) {
+        super(app);
+        this.entries = entries;
+        this.onChoose = onChoose; // ({ entry, side }) => void
+        this.setPlaceholder('Pick a snapshot to restore...');
+    }
+    getSuggestions(query) {
+        const q = query.toLowerCase();
+        const items = [];
+        for (const e of this.entries) {
+            if (e.remoteBefore) items.push({ e, side: 'remote', label: 'PwnDoc as it was' });
+            if (e.localBefore) items.push({ e, side: 'local', label: 'note as it was' });
+        }
+        return items.filter(i => `${i.e.ts} ${i.e.op} ${i.e.sections.join(' ')} ${i.label}`.toLowerCase().includes(q));
+    }
+    renderSuggestion(i, el) {
+        el.createEl('div', { text: `${i.e.ts.replace('T', ' ').slice(0, 19)} · before ${i.e.op} · ${i.label}` });
+        el.createEl('small', { text: `${i.e.sections.join(', ')}${i.e.forced ? ' · forced' : ''}`, cls: 'pwndoc-meta' });
+    }
+    onChooseSuggestion(i) { this.onChoose({ entry: i.e, side: i.side }); }
+}
+
+// ── Modal: choose the sections of a snapshot to restore ───────────────────────
+class RollbackModal extends Modal {
+    constructor(app, rows, { entry, side, auditState, onApply }) {
+        super(app);
+        this.rows = rows;
+        this.entry = entry;
+        this.side = side;
+        this.auditState = auditState;
+        this.onApply = onApply; // ({ sections, force }) => void
+    }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl('h3', { text: `Restore ${this.side === 'remote' ? 'PwnDoc' : 'the note'} from ${this.entry.ts.slice(0, 19).replace('T', ' ')}` });
+        let forceBox = null;
+        const guarded = this.side === 'remote' && this.auditState !== 'EDIT';
+        if (guarded) {
+            const wrap = contentEl.createEl('label');
+            forceBox = wrap.createEl('input', { type: 'checkbox' });
+            wrap.createEl('span', { text: ` Audit is ${this.auditState}: Enforce write (this operation only)` });
+        }
+        const ui = this.rows.map(row => {
+            const def = defOf(row.key);
+            const box = contentEl.createEl('div');
+            const head = box.createEl('label');
+            const check = head.createEl('input', { type: 'checkbox' });
+            check.checked = row.changed && !def.readOnly && this.entry.sections.includes(row.key);
+            check.disabled = !row.changed || !!def.readOnly;
+            head.createEl('strong', { text: ` ${def.aliases[0]} ` });
+            head.createEl('small', { text: row.changed ? 'differs from the snapshot' : 'same as the snapshot', cls: 'pwndoc-meta' });
+            if (row.changed) {
+                const det = box.createEl('details');
+                det.createEl('summary', { text: 'diff (current → snapshot)' });
+                const pre = det.createEl('pre');
+                pre.style.cssText = 'max-height:180px;overflow:auto;font-size:0.8em;';
+                for (const d of row.diff) {
+                    const l = pre.createEl('div', { text: `${{ eq: '  ', add: '+ ', del: '- ' }[d.op]}${d.line}` });
+                    if (d.op === 'add') l.style.color = 'var(--text-success)';
+                    if (d.op === 'del') l.style.color = 'var(--text-error)';
+                }
+            }
+            return { row, check };
+        });
+        const apply = contentEl.createEl('button', { text: 'Restore', cls: 'mod-cta' });
+        apply.style.marginTop = '10px';
+        apply.onclick = () => {
+            const sections = ui.filter(u => u.check.checked).map(u => u.row.key);
+            if (!sections.length) { new Notice('PwnDoc Importer: nothing selected.'); return; }
+            if (guarded && !forceBox.checked) { new Notice(`PwnDoc Importer: audit is ${this.auditState}, tick "Enforce" to restore.`); return; }
+            this.close();
+            this.onApply({ sections, force: !!forceBox?.checked });
+        };
+    }
+    onClose() { this.contentEl.empty(); }
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 class PwnDocImporterPlugin extends Plugin {
     async onload() {
@@ -1384,6 +1527,11 @@ class PwnDocImporterPlugin extends Plugin {
             id: 'compare-with-pwndoc',
             name: 'Compare with PwnDoc and merge sections',
             callback: () => this.compareWithPwndoc(),
+        });
+        this.addCommand({
+            id: 'rollback-from-history',
+            name: 'Restore from PwnDoc sync history (rollback)',
+            callback: () => this.rollbackFromHistory(),
         });
         this.registerEvent(this.app.vault.on('rename', async (file, oldPath) => {
             if (file.children === undefined) return; // folders only
@@ -1687,6 +1835,40 @@ class PwnDocImporterPlugin extends Plugin {
         }).open();
     }
 
+    async rollbackFromHistory() {
+        const file = this.app.workspace.getActiveFile();
+        const fm = file && this.app.metadataCache.getFileCache(file)?.frontmatter;
+        if (!fm?.pwndoc_finding_id) { new Notice('PwnDoc Importer: associate this note to a finding first.'); return; }
+        const auditId = resolveAuditId(file.path, fm, this.settings.folderAudits);
+        const findingId = fm.pwndoc_finding_id;
+        const ctx = this.syncCtx(file, findingId);
+        const entries = await listHistory(ctx.adapter, ctx.historyDir);
+        if (!entries.length) { new Notice('PwnDoc Importer: no history for this finding yet.'); return; }
+
+        new HistoryModal(this.app, entries, async ({ entry, side }) => {
+            try {
+                const { audit, finding } = await fetchFinding(ctx, auditId, findingId);
+                const noteMd = await this.app.vault.read(file);
+                const keys = SECTION_DEFS.map(d => d.key);
+                const rows = await buildRollbackComparison(ctx, entry, side, finding, noteMd, keys);
+                new RollbackModal(this.app, rows, {
+                    entry, side, auditState: audit.state,
+                    onApply: async ({ sections, force }) => {
+                        try {
+                            if (side === 'remote') {
+                                await rollbackSections(ctx, { entry, side, sections, noteMd, auditId, findingId, force, snapshotFinding: finding });
+                            } else {
+                                const r = await rollbackSections(ctx, { entry, side, sections, noteMd: await this.app.vault.read(file), auditId, findingId, force });
+                                await this.app.vault.modify(file, r.noteMd);
+                            }
+                            new Notice(`PwnDoc Importer: restored ${sections.length} section(s).`);
+                        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+                    },
+                }).open();
+            } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
+        }).open();
+    }
+
     // Step 2 — ask VT or M
     askPrefix(vuln) {
         new PrefixModal(this.app, prefix => this.askFolder(vuln, prefix)).open();
@@ -1840,4 +2022,5 @@ module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, D
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
     historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase,
-    AuditLockedError, assertEditable, findingHash, assertUnchanged, isEmptyValue, pushSections, pullSections };
+    AuditLockedError, assertEditable, findingHash, assertUnchanged, isEmptyValue, pushSections, pullSections,
+    restoreRemotePatch, restoreLocal, buildRollbackComparison, rollbackSections };

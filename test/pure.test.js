@@ -480,3 +480,60 @@ test('pullSections refuses to blank a populated local section when PwnDoc has no
     const ctx = syncCtx({ remote: { poc: '' }, confirmEmpty: async () => false });
     await assert.rejects(T.pullSections(ctx, { auditId: AID, findingId: FID, noteMd: '## Evidenza\n\nmy evidence\n', sections: ['poc'], force: false }), /empty/i);
 });
+
+// ── rollback ──────────────────────────────────────────────────────────────────
+test('restoreRemotePatch builds a patch from the snapshot for the requested sections only', () => {
+    const snap = { poc: '<p>old poc</p>', description: '<p>old desc</p>', scope: 'old', references: ['r1'] };
+    assert.deepEqual(T.restoreRemotePatch(snap, ['poc', 'scope', 'references']), { poc: '<p>old poc</p>', scope: 'old', references: ['r1'] });
+});
+
+test('restoreLocal puts the snapshot sections back and leaves the others alone', () => {
+    const snap = '## Descrizione\n\nold desc\n\n## Evidenza\n\nold poc\n';
+    const cur = '## Descrizione\n\nnew desc\n\n## Evidenza\n\nnew poc\n';
+    const out = T.restoreLocal(cur, snap, ['poc']);
+    assert.equal(T.parseSections(out).poc.text, 'old poc');
+    assert.equal(T.parseSections(out).description.text, 'new desc');
+});
+
+test('rollbackSections restores PwnDoc from a push entry, records a rollback entry, and can itself be rolled back', async () => {
+    const ctx = syncCtx();
+    const original = clone(ctx.finding);
+    await T.pushSections(ctx, pushArgs(ctx));
+    const [pushEntry] = await T.listHistory(ctx.hist, ctx.historyDir);
+    assert.equal(ctx.finding.poc, '<p>local poc</p>');
+
+    await T.rollbackSections(ctx, { entry: pushEntry, auditId: AID, findingId: FID, side: 'remote', sections: ['poc'], noteMd: NOTE_ONLY_POC, force: false });
+    assert.equal(ctx.finding.poc, original.poc);
+    const hist = await T.listHistory(ctx.hist, ctx.historyDir);
+    assert.equal(hist[0].op, 'rollback');
+    assert.equal(hist[0].remoteBefore.poc, '<p>local poc</p>');
+
+    await T.rollbackSections(ctx, { entry: hist[0], auditId: AID, findingId: FID, side: 'remote', sections: ['poc'], noteMd: NOTE_ONLY_POC, force: false });
+    assert.equal(ctx.finding.poc, '<p>local poc</p>');
+});
+
+test('rollbackSections on PwnDoc honours the audit state guard', async () => {
+    const ctx = syncCtx({ state: 'REVIEW' });
+    const entry = { remoteBefore: { ...ctx.finding, poc: '<p>old</p>' }, localBefore: null, sections: ['poc'] };
+    await assert.rejects(T.rollbackSections(ctx, { entry, auditId: AID, findingId: FID, side: 'remote', sections: ['poc'], noteMd: '', force: false }), /REVIEW/);
+    assert.equal(ctx.log.puts.length, 0);
+    await T.rollbackSections(ctx, { entry, auditId: AID, findingId: FID, side: 'remote', sections: ['poc'], noteMd: '', force: true });
+    assert.equal(ctx.log.puts.length, 1);
+});
+
+test('rollbackSections on the note returns the restored text and records the old note', async () => {
+    const ctx = syncCtx();
+    const entry = { remoteBefore: null, localBefore: '## Evidenza\n\nold poc\n', sections: ['poc'] };
+    const r = await T.rollbackSections(ctx, { entry, auditId: AID, findingId: FID, side: 'local', sections: ['poc'], noteMd: '## Evidenza\n\nnew poc\n', force: false });
+    assert.equal(T.parseSections(r.noteMd).poc.text, 'old poc');
+    const h = await T.listHistory(ctx.hist, ctx.historyDir);
+    assert.equal(h[0].localBefore, '## Evidenza\n\nnew poc\n');
+    assert.equal(ctx.log.puts.length, 0);
+});
+
+test('buildRollbackComparison marks which sections differ from the snapshot', async () => {
+    const entry = { remoteBefore: { poc: '<p>old</p>', description: '<p>same</p>' }, localBefore: null, sections: ['poc'] };
+    const cur = { poc: '<p>new</p>', description: '<p>same</p>' };
+    const rows = await T.buildRollbackComparison(syncCtx(), entry, 'remote', cur, '', ['poc', 'description']);
+    assert.deepEqual(rows.map(r => [r.key, r.changed]), [['poc', true], ['description', false]]);
+});
