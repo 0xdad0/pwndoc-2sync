@@ -135,6 +135,10 @@ Link notes to a PwnDoc **engagement (audit)**, compare them with the matching **
 
 Nothing is written to PwnDoc before you press Apply (or confirm a status change); creating a finding is the only write that happens earlier, and it asks first. On an audit not in state `EDIT` every write needs **Enforce**.
 
+### Create an engagement
+
+**Create a new engagement on PwnDoc** (command, status-bar menu, or right-click a folder → *Create a new engagement for this folder*) opens a form with the name (prefilled with the folder name), audit type, language, report template (default: the one of the audit type for that language) and optional start and end date. Audit type and language are remembered for the next time; a name that already exists asks for confirmation. After creation the folder is associated with the new engagement (started from a folder it is automatic, otherwise you are asked), and a check lists the mandatory General Information fields that are still blank. **Company and client are not set from Obsidian**: fill them in on PwnDoc. Creating an engagement writes only the new audit, nothing existing.
+
 ### Associating notes
 
 | Command | What it does |

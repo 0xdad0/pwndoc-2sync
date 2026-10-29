@@ -1278,3 +1278,45 @@ test('deleteFinding is blocked on a non-EDIT audit unless enforced, and does not
     await assert.rejects(T.deleteFinding(ctx, { auditId: AID, findingId: 'nope', force: false }), /finding not found/);
     assert.deepEqual(ctx.log.deletes, []);
 });
+
+// ── create an engagement ──────────────────────────────────────────────────────
+function auditApi({ createReply = { audit: { _id: 'NEW1', name: 'Acme' } }, audits = [] } = {}) {
+    const calls = [];
+    const api = async (method, path, opts) => {
+        calls.push([method, path, opts?.body]);
+        if (method === 'POST' && path === '/api/audits') return createReply;
+        if (method === 'GET' && path === '/api/audits') return audits;
+        return 'ok';
+    };
+    return { api, calls };
+}
+
+test('createAudit posts the three required fields, then sets template and dates only when given', async () => {
+    let t = auditApi();
+    assert.equal(await T.createAudit(t, { name: ' Acme web ', language: 'IT-it', auditType: 'WAPT' }), 'NEW1');
+    assert.deepEqual(t.calls, [['POST', '/api/audits', { name: 'Acme web', language: 'IT-it', auditType: 'WAPT' }]]);
+    t = auditApi();
+    await T.createAudit(t, { name: 'A', language: 'EN-en', auditType: 'WAPT', template: 't2', dateStart: '2026-11-02', dateEnd: '2026-11-06' });
+    assert.deepEqual(t.calls[1], ['PUT', '/api/audits/NEW1/general', { template: 't2', date_start: '2026-11-02', date_end: '2026-11-06' }]);
+});
+
+test('createAudit finds the new id by name when the reply does not carry it', async () => {
+    const t = auditApi({ createReply: 'Audit created successfully', audits: [
+        { _id: 'old', name: 'Acme', createdAt: '2026-01-01T00:00:00Z' }, { _id: 'new', name: 'Acme', createdAt: '2026-10-29T00:00:00Z' }, { _id: 'x', name: 'Other', createdAt: '2026-12-01T00:00:00Z' }] });
+    assert.equal(await T.createAudit(t, { name: 'Acme', language: 'IT-it', auditType: 'WAPT' }), 'new');
+    await assert.rejects(T.createAudit(auditApi({ createReply: 'ok', audits: [] }), { name: 'Acme', language: 'IT-it', auditType: 'WAPT' }), /created but not found/);
+});
+
+test('createAudit validates before any call', async () => {
+    for (const bad of [{ name: '  ', language: 'IT-it', auditType: 'WAPT' }, { name: 'A', language: '', auditType: 'WAPT' }, { name: 'A', language: 'IT-it', auditType: '' },
+        { name: 'A', language: 'IT-it', auditType: 'W', dateStart: '2/11/2026' }, { name: 'A', language: 'IT-it', auditType: 'W', dateStart: '2026-11-06', dateEnd: '2026-11-02' }]) {
+        const t = auditApi();
+        await assert.rejects(T.createAudit(t, bad));
+        assert.deepEqual(t.calls, []);
+    }
+});
+
+test('nameTaken ignores case and spacing', () => {
+    assert.equal(T.nameTaken([{ name: 'Acme  Web' }], 'acme web'), true);
+    assert.equal(T.nameTaken([{ name: 'Acme' }], 'Other'), false);
+});

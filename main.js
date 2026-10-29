@@ -1134,6 +1134,35 @@ function bulkSummary(rows, direction, keys) {
     return out;
 }
 
+// ── Create an engagement ──────────────────────────────────────────────────────
+const nameTaken = (audits, name) => audits.some(a => normTitle(a.name) === normTitle(name));
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// POST /api/audits needs name, language and audit type; PwnDoc picks the template of the audit type for that language.
+// Template and dates are optional and go in a second call. Returns the id of the new audit.
+async function createAudit(ctx, { name, language, auditType, template, dateStart, dateEnd }) {
+    name = String(name || '').trim();
+    if (!name) throw new Error('the engagement needs a name');
+    if (!language) throw new Error('choose a language');
+    if (!auditType) throw new Error('choose an audit type');
+    for (const [label, d] of [['start date', dateStart], ['end date', dateEnd]]) {
+        if (d && !DATE_RE.test(d)) throw new Error(`${label} must be YYYY-MM-DD`);
+    }
+    if (dateStart && dateEnd && dateEnd < dateStart) throw new Error('the end date is before the start date');
+
+    const res = await ctx.api('POST', '/api/audits', { body: { name, language, auditType } });
+    let id = res?.audit?._id ?? res?._id;
+    if (!id) {
+        const mine = ((await ctx.api('GET', '/api/audits')) || []).filter(a => a.name === name)
+            .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+        id = mine[0]?._id;
+    }
+    if (!id) throw new Error('engagement created but not found afterwards');
+    const general = { ...(template ? { template } : {}), ...(dateStart ? { date_start: dateStart } : {}), ...(dateEnd ? { date_end: dateEnd } : {}) };
+    if (Object.keys(general).length) await ctx.api('PUT', `/api/audits/${id}/general`, { body: general });
+    return id;
+}
+
 // ── Report template of the engagement and report generation ───────────────────
 const templateIdOf = audit => audit.template?._id ?? audit.template ?? null;
 
@@ -1370,6 +1399,8 @@ const DEFAULT_SETTINGS = {
     watchRemote:     true,  // warn when PwnDoc changed a synced section of the open note
     watchIntervalMin: 5,    // 0 = only when a note is opened
     reportsFolder:   'reports', // where generated reports are saved (vault path)
+    lastAuditType:   '',    // remembered for the next new engagement
+    lastLanguage:    '',
     generalRequired: DEFAULT_GENERAL_REQUIRED.join(','), // General Information fields checked when an export fails
 };
 
@@ -2304,6 +2335,53 @@ class PromptModal extends Modal {
     onClose() { this.contentEl.empty(); if (!this.done) this.onSubmit(null); }
 }
 
+// ── Modal: new engagement form ────────────────────────────────────────────────
+// opts: { name, auditTypes: [{name}], languages: [{locale, language}], templates: [{_id, name, ext}], auditType, language }
+class NewAuditModal extends Modal {
+    constructor(app, opts, onSubmit) {
+        super(app);
+        this.opts = opts;
+        this.onSubmit = onSubmit; // (form | null) => void
+        this.done = false;
+    }
+    onOpen() {
+        const { contentEl, opts } = this;
+        contentEl.createEl('h3', { text: 'New PwnDoc engagement' });
+        const row = label => {
+            const r = contentEl.createEl('div');
+            r.style.cssText = 'display:flex;flex-direction:column;margin-bottom:8px;';
+            r.createEl('small', { text: label, cls: 'pwndoc-meta' });
+            return r;
+        };
+        const name = row('Name').createEl('input', { type: 'text' });
+        name.value = opts.name || '';
+        const select = (label, items, current) => {
+            const s = row(label).createEl('select');
+            for (const [value, text] of items) s.createEl('option', { text, value });
+            if (current && items.some(i => i[0] === current)) s.value = current;
+            return s;
+        };
+        const type = select('Audit type', opts.auditTypes.map(t => [t.name, t.name]), opts.auditType);
+        const lang = select('Language', opts.languages.map(l => [l.locale, `${l.language} (${l.locale})`]), opts.language);
+        const tpl = select('Report template', [['', 'Default of the audit type'], ...opts.templates.map(t => [t._id, `${t.name} (${t.ext})`])], '');
+        const dates = row('Start and end date (optional)');
+        const d = dates.createEl('div');
+        d.style.cssText = 'display:flex;gap:8px;';
+        const start = d.createEl('input', { type: 'date' });
+        const end = d.createEl('input', { type: 'date' });
+        row('Company and client are not set here: fill them in on PwnDoc, the check after creation tells what is still missing.');
+        const go = contentEl.createEl('button', { text: 'Create', cls: 'mod-cta' });
+        go.onclick = () => {
+            if (!name.value.trim()) { new Notice('PwnDoc 2Sync: the engagement needs a name.'); return; }
+            this.done = true;
+            this.close();
+            this.onSubmit({ name: name.value, auditType: type.value, language: lang.value, template: tpl.value, dateStart: start.value, dateEnd: end.value });
+        };
+        setTimeout(() => name.focus(), 0);
+    }
+    onClose() { this.contentEl.empty(); if (!this.done) this.onSubmit(null); }
+}
+
 // ── Modal: a titled list of lines ─────────────────────────────────────────────
 class InfoModal extends Modal {
     constructor(app, title, lines) { super(app); this.title = title; this.lines = lines; }
@@ -2630,6 +2708,7 @@ class PwnDocImporterPlugin extends Plugin {
         cmd('engagement-dashboard', 'Engagement dashboard (sync status of every note)', () => this.openDashboard());
         cmd('lint-note', 'Lint this note before pushing', () => this.lintCurrentNote());
         cmd('delete-finding', 'Delete this note\'s finding from PwnDoc', () => this.deleteNoteFindingCommand());
+        cmd('create-engagement', 'Create a new engagement on PwnDoc', () => this.createEngagement());
         cmd('unlink-note', 'Unlink note from its PwnDoc finding', () => this.unlinkNote());
         cmd('find-orphans', 'Find orphan notes (finding or engagement gone from PwnDoc)', () => this.findOrphans());
         cmd('finding-completed', 'Mark PwnDoc finding as completed', () => this.setCompleted(true));
@@ -2654,6 +2733,8 @@ class PwnDocImporterPlugin extends Plugin {
             if (file.children === undefined) return;
             menu.addItem(i => i.setTitle('Associate to PwnDoc engagement').setIcon('shield-plus')
                 .onClick(() => this.associateFolder(file.path === '/' ? '' : file.path)));
+            menu.addItem(i => i.setTitle('Create a new engagement for this folder').setIcon('plus-square')
+                .onClick(() => this.createEngagement(file.path === '/' ? '' : file.path)));
             menu.addItem(i => i.setTitle('Engagement dashboard').setIcon('layout-dashboard')
                 .onClick(() => this.openDashboard(file.path === '/' ? '' : file.path)));
             menu.addItem(i => i.setTitle('Import findings from PwnDoc here').setIcon('download')
@@ -2857,10 +2938,42 @@ class PwnDocImporterPlugin extends Plugin {
         });
     }
 
+    // Create a new engagement on PwnDoc, then associate a folder with it. folderArg: the folder it is created for.
+    async createEngagement(folderArg) {
+        try {
+            const get = p => this.api('GET', p);
+            const [types, langs, templates, audits] = await Promise.all([get('/api/data/audit-types'), get('/api/data/languages'), get('/api/templates'), get('/api/audits')]);
+            const auditTypes = (types || []).filter(t => !t.hidden);
+            if (!auditTypes.length || !langs?.length) { new Notice('PwnDoc 2Sync: PwnDoc returned no audit types or languages.'); return; }
+            const active = this.app.workspace.getActiveFile();
+            const folder = folderArg ?? (active?.parent?.path === '/' ? '' : active?.parent?.path ?? '');
+            const form = await new Promise(r => new NewAuditModal(this.app, {
+                name: folder.split('/').pop(), auditTypes, languages: langs, templates: templates || [],
+                auditType: this.settings.lastAuditType, language: this.settings.lastLanguage,
+            }, r).open());
+            if (!form) return;
+            if (nameTaken(audits || [], form.name)
+                && !(await new Promise(r => new ConfirmModal(this.app, `An engagement named "${form.name.trim()}" already exists. Create another one with the same name?`, r).open()))) return;
+
+            const id = await createAudit({ api: (m, p, o) => this.api(m, p, o) }, form);
+            Object.assign(this.settings, { lastAuditType: form.auditType, lastLanguage: form.language });
+            await this.saveSettings();
+            const audit = await get(`/api/audits/${id}`);
+            new Notice(`PwnDoc 2Sync: engagement "${audit.name}" created.`);
+
+            if (folderArg !== undefined) await this.associateFolder(folderArg, audit);
+            else if (await new Promise(r => new ConfirmModal(this.app, `Associate a vault folder with "${audit.name}" now?`, r).open())) await this.associateFolder(undefined, audit);
+
+            await this.loadCustomFieldDefs();
+            const missing = missingGeneralFields(audit, this.generalRequired(), this.cfDefs || []);
+            if (missing.length) new InfoModal(this.app, `"${audit.name}" created`, ['Still to fill in on PwnDoc (General Information) before a report can be exported:', ...missing.map(m => `- ${m.label}`)]).open();
+        } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); console.error(e); }
+    }
+
     // Associate a folder with an engagement and write it on every note it owns (subfolders included)
-    async associateFolder(folderArg) {
+    async associateFolder(folderArg, auditArg) {
         const run = async folder => {
-            const audit = await this.pickAudit();
+            const audit = auditArg ?? await this.pickAudit();
             if (!audit) return;
             this.settings.folderAudits[folder] = { auditId: audit._id, name: audit.name };
             await this.saveSettings();
@@ -2976,6 +3089,7 @@ class PwnDocImporterPlugin extends Plugin {
         item('Choose report template', 'file-cog', () => this.setTemplateCommand());
         item('Generate report', 'file-output', () => this.generateReportCommand());
         menu.addSeparator();
+        item('Create a new engagement', 'plus-square', () => this.createEngagement());
         item('Associate folder to engagement', 'folder-plus', () => this.associateFolder());
         item('Refresh engagement attribute on notes', 'refresh-cw', () => this.refreshEngagementAttributes());
         menu.showAtMouseEvent(evt);
@@ -3730,7 +3844,7 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { deleteFinding, sortDashboardRows, dashboardCounts, filterDashboardRows, bulkSummary, missingGeneralFields, reportFailureLines, GENERAL_FIELDS, DEFAULT_GENERAL_REQUIRED, setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
+module.exports.__test = { createAudit, nameTaken, deleteFinding, sortDashboardRows, dashboardCounts, filterDashboardRows, bulkSummary, missingGeneralFields, reportFailureLines, GENERAL_FIELDS, DEFAULT_GENERAL_REQUIRED, setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
     sideBySide, missingFindings, findingToNoteRow, IMPORT_SECTIONS, folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,
