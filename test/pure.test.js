@@ -457,11 +457,6 @@ test('pushSections uploads images as tokens and aborts before any PUT when an im
     assert.equal((await T.listHistory(bad.hist, bad.historyDir)).length, 0);
 });
 
-test('pushSections refuses read-only sections', async () => {
-    const ctx = syncCtx();
-    await assert.rejects(T.pushSections(ctx, pushArgs(ctx, { sections: ['customFields'] })), /read-only/);
-});
-
 test('pullSections fills only the requested section of a note that only had Evidenza, records history and base', async () => {
     const ctx = syncCtx({ remote: { poc: `<p>pulled</p><p><img src="${'c'.repeat(24)}" alt="F1"></p>` } });
     const note = '## Descrizione\n\nmine\n\n## Evidenza\n\n\n## Assets\n\n';
@@ -593,7 +588,7 @@ test('pullSections returns title and CVSS as meta and leaves the note body alone
 });
 
 test('labelOf names every section, including title and CVSS which have no heading alias', () => {
-    assert.deepEqual(T.SECTION_DEFS.map(T.labelOf), ['Descrizione', 'Impatto', 'Evidenza', 'Assets', 'Remediation', 'References', 'Custom Fields', 'Title', 'CVSS vector']);
+    assert.deepEqual(T.SECTION_DEFS.map(T.labelOf), ['Descrizione', 'Impatto', 'Evidenza', 'Assets', 'Remediation', 'References', 'Custom Fields', 'Title', 'CVSS vector', 'Vulnerability type', 'Priority', 'Remediation complexity', 'Completed']);
 });
 
 // ── three-way merge ───────────────────────────────────────────────────────────
@@ -876,4 +871,109 @@ test('findingToNoteRow builds the importer row from a finding and the audit lang
 
 test('importSectionKeys are the sections pulled into a freshly imported note (no title/CVSS, those are already set)', () => {
     assert.deepEqual(T.IMPORT_SECTIONS, ['description', 'observation', 'poc', 'scope', 'remediation', 'references']);
+});
+
+// ── other fields, completion status, writable custom fields ───────────────────
+test('priority, complexity and completion compare in a common form and survive a push/pull cycle', () => {
+    const d = k => T.SECTION_DEFS.find(x => x.key === k);
+    assert.equal(d('priority').cmpLocal('High'), 'high');
+    assert.equal(d('priority').cmpLocal(3), 'high');
+    assert.equal(d('priority').cmpRemote(3), 'high');
+    assert.equal(d('priority').cmpRemote(undefined), '');
+    assert.equal(d('priority').toRemote('urgent'), 4);
+    assert.equal(d('priority').toRemote('banana'), undefined);
+    assert.equal(d('remediationComplexity').toRemote('hard'), 3);
+    assert.equal(d('status').cmpLocal('DRAFT'), 'in progress');
+    assert.equal(d('status').cmpLocal('completed'), 'completed');
+    assert.equal(d('status').cmpLocal('Done'), 'completed');
+    assert.equal(d('status').cmpRemote(T.STATUS_DONE), 'completed');
+    assert.equal(d('status').cmpRemote(T.STATUS_OPEN), 'in progress');
+    assert.equal(d('status').toRemote('completed'), T.STATUS_DONE);
+});
+
+test('metaToFrontmatter writes the pulled completion without clobbering a custom workflow status', () => {
+    assert.deepEqual(T.metaToFrontmatter({ status: 'completed' }, { status: 'DRAFT' }), { status: 'COMPLETED' });
+    assert.deepEqual(T.metaToFrontmatter({ status: 'in progress' }, { status: 'COMPLETED' }), { status: 'DRAFT' });
+    assert.deepEqual(T.metaToFrontmatter({ status: 'in progress' }, { status: 'REVIEW' }), {});
+    assert.deepEqual(T.metaToFrontmatter({ priority: 'high', remediationComplexity: '' }, {}), { priority: 'high' });
+    assert.deepEqual(T.metaToFrontmatter({ vulnType: 'WAPT' }, { category: 'old' }), { category: 'WAPT' });
+});
+
+test('pushSections sends the enum and status codes and skips an empty enum instead of blanking it', async () => {
+    const ctx = syncCtx({ remote: { priority: 2, remediationComplexity: 1, status: T.STATUS_OPEN, vulnType: 'WAPT' } });
+    const note = '---\n---\n';
+    ctx.noteInfo = { basename: 'VT-01 - T', fm: { priority: 'urgent', status: 'COMPLETED', category: 'Mobile' } };
+    await T.pushSections(ctx, pushArgs(ctx, { noteMd: note, sections: ['priority', 'remediationComplexity', 'status', 'vulnType'] }));
+    assert.deepEqual(ctx.log.puts[0].body, { priority: 4, status: T.STATUS_DONE, vulnType: 'Mobile' });
+});
+
+test('pushSections rejects an unknown priority name before writing', async () => {
+    const ctx = syncCtx({ remote: { priority: 2 } });
+    ctx.noteInfo = { basename: 'VT-01 - T', fm: { priority: 'banana' } };
+    await assert.rejects(T.pushSections(ctx, pushArgs(ctx, { noteMd: '', sections: ['priority'] })), /invalid Priority/);
+    assert.equal(ctx.log.puts.length, 0);
+});
+
+test('pullSections returns the codec form of the other fields as meta and records it as base', async () => {
+    const ctx = syncCtx({ remote: { priority: 3, status: T.STATUS_DONE, vulnType: 'WAPT' } });
+    const r = await T.pullSections(ctx, { auditId: AID, findingId: FID, noteMd: '', sections: ['priority', 'status', 'vulnType'] });
+    assert.deepEqual(r.meta, { priority: 'high', status: 'completed', vulnType: 'WAPT' });
+    assert.deepEqual((await T.loadBase(ctx.hist, ctx.historyDir)).sections, { priority: 'high', status: 'completed', vulnType: 'WAPT' });
+});
+
+test('buildComparison compares the other fields in codec form', async () => {
+    const f = { ...FINDING, priority: 3, status: T.STATUS_DONE };
+    const info = { basename: 'VT-01 - T', fm: { priority: 'High', status: 'DRAFT' } };
+    const rows = await T.buildComparison(cmpCtx, '', f, ['priority', 'status'], info);
+    assert.equal(rows[0].changed, false);
+    assert.deepEqual([rows[1].local, rows[1].remote], ['in progress', 'completed']);
+});
+
+test('rollback of a numeric field restores its snapshot and skips fields the snapshot never had', () => {
+    assert.deepEqual(T.restoreRemotePatch({ priority: 2 }, ['priority', 'status']), { priority: 2 });
+});
+
+test('setFindingStatus patches only status, records history, honours the state guard', async () => {
+    const ctx = syncCtx({ remote: { status: T.STATUS_OPEN } });
+    await T.setFindingStatus(ctx, { auditId: AID, findingId: FID, completed: true, force: false });
+    assert.deepEqual(ctx.log.puts[0].body, { status: T.STATUS_DONE });
+    const h = await T.listHistory(ctx.hist, ctx.historyDir);
+    assert.equal(h[0].op, 'status');
+    assert.deepEqual((await T.loadBase(ctx.hist, ctx.historyDir)).sections, { status: 'completed' });
+    const locked = syncCtx({ state: 'REVIEW' });
+    await assert.rejects(T.setFindingStatus(locked, { auditId: AID, findingId: FID, completed: true, force: false }), /not EDIT/);
+    assert.equal(locked.log.puts.length, 0);
+    await T.setFindingStatus(locked, { auditId: AID, findingId: FID, completed: false, force: true });
+    assert.deepEqual(locked.log.puts[0].body, { status: T.STATUS_OPEN });
+});
+
+const CF_REMOTE = [
+    { customField: { _id: 'cf1', label: 'CWE', fieldType: 'input' }, text: 'CWE-79' },
+    { customField: { _id: 'cf2', label: 'Note', fieldType: 'text' }, text: '<p>old</p>' },
+    { customField: { _id: 'cf3', label: 'Multi', fieldType: 'select-multiple' }, text: ['a', 'b'] },
+];
+
+test('parseCustomFieldsText reads the **label** blocks written by the importer', () => {
+    assert.deepEqual(T.parseCustomFieldsText('**CWE**\n\nCWE-79\n\n**Note**\n\nline1\nline2\n'), [
+        { label: 'CWE', md: 'CWE-79' }, { label: 'Note', md: 'line1\nline2' },
+    ]);
+    assert.deepEqual(T.parseCustomFieldsText(''), []);
+});
+
+test('customFieldsPatch updates only the matching fields, keeps the others and types the value', async () => {
+    const ctx = syncCtx();
+    const patch = await T.customFieldsPatch(ctx, AID, { customFields: CF_REMOTE }, '**CWE**\n\nCWE-89\n\n**Note**\n\nnew');
+    assert.deepEqual(patch, [
+        { customField: 'cf1', text: 'CWE-89' },
+        { customField: 'cf2', text: '<p>new</p>' },
+        { customField: 'cf3', text: ['a', 'b'] },
+    ]);
+    await assert.rejects(T.customFieldsPatch(ctx, AID, { customFields: CF_REMOTE }, '**Nope**\n\nx'), /unknown custom field "Nope"/);
+    await assert.rejects(T.customFieldsPatch(ctx, AID, { customFields: CF_REMOTE }, '**Multi**\n\nx'), /cannot be edited/);
+});
+
+test('custom fields are no longer read-only: a push sends the merged array', async () => {
+    const ctx = syncCtx({ remote: { customFields: clone(CF_REMOTE) } });
+    await T.pushSections(ctx, pushArgs(ctx, { noteMd: '## Custom Fields\n\n**CWE**\n\nCWE-89\n', sections: ['customFields'] }));
+    assert.deepEqual(ctx.log.puts[0].body.customFields.find(c => c.customField === 'cf1'), { customField: 'cf1', text: 'CWE-89' });
 });

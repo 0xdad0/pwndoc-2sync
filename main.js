@@ -82,6 +82,23 @@ function computeCVSS31(vector) {
 }
 
 // ── Note sections ─────────────────────────────────────────────────────────────
+// Frontmatter-backed fields share one shape: cmpLocal(raw frontmatter value) and cmpRemote(finding value) give the same
+// comparison string, toRemote(cmp) the value to PUT (undefined = not representable), toFm(cmp, current) the frontmatter
+// value a pull writes (undefined = leave as is)
+const STATUS_DONE = 0, STATUS_OPEN = 1; // finding.status in PwnDoc: 0 completed, 1 in progress
+const enumCodec = names => ({
+    cmpLocal: raw => { const n = Number(raw); return raw !== '' && raw != null && n >= 1 && n <= names.length ? names[n - 1] : String(raw ?? '').trim().toLowerCase(); },
+    cmpRemote: v => names[v - 1] ?? '',
+    toRemote: cmp => { const i = names.indexOf(cmp); return i >= 0 ? i + 1 : undefined; },
+    toFm: cmp => cmp || undefined,
+});
+const isCompletedLocal = raw => /^(completed|done)$/i.test(String(raw ?? '').trim());
+const statusCodec = {
+    cmpLocal: raw => (isCompletedLocal(raw) ? 'completed' : 'in progress'),
+    cmpRemote: v => (v === STATUS_DONE ? 'completed' : 'in progress'),
+    toRemote: cmp => (cmp === 'completed' ? STATUS_DONE : STATUS_OPEN),
+    toFm: (cmp, cur) => (cmp === 'completed' ? 'COMPLETED' : isCompletedLocal(cur) ? 'DRAFT' : undefined),
+};
 const SECTION_DEFS = [
     { key: 'description',  field: 'description',  kind: 'html',   aliases: ['Descrizione', 'Description'] },
     { key: 'observation',  field: 'observation',  kind: 'html',   aliases: ['Impatto', 'Impact', 'Observation'] },
@@ -89,9 +106,16 @@ const SECTION_DEFS = [
     { key: 'scope',        field: 'scope',        kind: 'text',   aliases: ['Assets'] },
     { key: 'remediation',  field: 'remediation',  kind: 'html',   aliases: ['Remediation'] },
     { key: 'references',   field: 'references',   kind: 'list',   aliases: ['References'] },
-    { key: 'customFields', field: 'customFields', kind: 'custom', aliases: ['Custom Fields'], readOnly: true }, // shown in the diff, never pushed or pulled
+    { key: 'customFields', field: 'customFields', kind: 'custom', aliases: ['Custom Fields'] }, // **label** blocks, one per PwnDoc custom field
     { key: 'title',  field: 'title',  kind: 'text', aliases: [], label: 'Title',       source: 'filename' },
     { key: 'cvssv3', field: 'cvssv3', kind: 'text', aliases: [], label: 'CVSS vector', source: 'frontmatter', fmKey: 'cvss_vector' },
+    { key: 'vulnType', field: 'vulnType', kind: 'text', aliases: [], label: 'Vulnerability type', source: 'frontmatter', fmKey: 'category',
+      cmpLocal: raw => String(raw ?? '').trim(), cmpRemote: v => String(v ?? '').trim(), toRemote: c => c || undefined, toFm: c => c || undefined },
+    { key: 'priority', field: 'priority', kind: 'enum', aliases: [], label: 'Priority', source: 'frontmatter', fmKey: 'priority',
+      ...enumCodec(['low', 'medium', 'high', 'urgent']) },
+    { key: 'remediationComplexity', field: 'remediationComplexity', kind: 'enum', aliases: [], label: 'Remediation complexity', source: 'frontmatter', fmKey: 'remediation_complexity',
+      ...enumCodec(['easy', 'medium', 'hard']) },
+    { key: 'status', field: 'status', kind: 'status', aliases: [], label: 'Completed', source: 'frontmatter', fmKey: 'status', ...statusCodec },
 ];
 const DEFAULT_SYNC_SECTIONS = ['poc'];
 const ALIAS_TO_KEY = new Map(SECTION_DEFS.flatMap(d => d.aliases.map(a => [a.toLowerCase(), d.key])));
@@ -383,15 +407,18 @@ async function buildComparison(ctx, noteMd, finding, keys, noteInfo = {}, base =
             local = listLines(localRaw);
             remote = (finding[def.field] || []).map(s => s.trim()).filter(Boolean).join('\n');
         } else if (def.kind === 'custom') {
-            local = localRaw.trim();
+            local = canonCustom(localRaw);
             remote = renderCustomFields(finding, ctx);
+        } else if (def.cmpLocal) {
+            local = def.cmpLocal(localRaw);
+            remote = def.cmpRemote(finding[def.field]);
         } else {
             local = localRaw.trim();
             remote = def.key === 'title' ? sanitizeTitle(finding.title) : String(finding[def.field] || '').trim();
         }
         const baseText = base?.sections?.[key];
         const status = classify(baseText, local, remote);
-        const merge = status === 'conflict' && !def.source && !def.readOnly ? merge3(baseText, local, remote) : null;
+        const merge = status === 'conflict' && !def.source ? merge3(baseText, local, remote) : null;
         rows.push({ key, local, remote, base: baseText, status, merge, changed: local !== remote, localEmpty: local === '', remoteEmpty: remote === '', diff: lineDiff(remote, local) });
     }
     return rows;
@@ -467,7 +494,14 @@ function isEmptyValue(v) {
 
 const defOf = key => SECTION_DEFS.find(d => d.key === key);
 
-async function localToRemote(ctx, auditId, def, text) {
+async function localToRemote(ctx, auditId, def, text, fresh) {
+    if (def.toRemote) {
+        const cmp = def.cmpLocal(text);
+        const v = def.toRemote(cmp);
+        if (v === undefined && cmp !== '') throw new Error(`invalid ${labelOf(def)}: ${text}`);
+        return v; // undefined: nothing to send, the field is left alone
+    }
+    if (def.kind === 'custom') return customFieldsPatch(ctx, auditId, fresh, text);
     if (def.key === 'cvssv3' && text && !isValidCvss31(text)) throw new Error(`invalid CVSS vector: ${text}`);
     const v = await localToRemoteBase(ctx, auditId, def, text);
     return def.key === 'title' ? v.replace(FILENAME_UNSAFE_RE, '-') : v;
@@ -479,13 +513,16 @@ async function localToRemoteBase(ctx, auditId, def, text) {
     return text.trim();
 }
 
-async function remoteToLocal(ctx, def, value) {
+async function remoteToLocal(ctx, def, value, fresh) {
+    if (def.kind === 'custom') return renderCustomFields(fresh, ctx);
     if (def.kind === 'html') return pullImages(ctx, ctx.htmlToMd(value || ''), ctx.attachmentsFolder);
     if (def.kind === 'list') return (value || []).map(s => `- ${s}`).join('\n');
     return String(value ?? '');
 }
 
 async function comparisonForm(ctx, def, text) {
+    if (def.cmpLocal) return def.cmpLocal(text);
+    if (def.kind === 'custom') return canonCustom(text);
     if (def.kind === 'html') return ctx.normalize(text);
     if (def.kind === 'list') return listLines(text);
     return text.trim();
@@ -502,8 +539,6 @@ async function fetchFinding(ctx, auditId, findingId) {
 // state guard, the changed-since-compare check and a history entry. Nothing is written if any step throws.
 async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapshotFinding, force, op = 'push', localBefore = noteMd }) {
     const defs = sections.map(defOf);
-    const ro = defs.find(d => d.readOnly);
-    if (ro) throw new Error(`section ${ro.key} is read-only`);
     const { audit, finding: fresh } = await fetchFinding(ctx, auditId, findingId);
     assertEditable(audit, force);
     assertUnchanged(findingHash(snapshotFinding, sections), fresh, sections);
@@ -513,7 +548,8 @@ async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapsho
     const baseSections = {};
     for (const def of defs) {
         const text = def.source ? localValue({ ...ctx.noteInfo, md: noteMd }, def) : secs[def.key]?.text || '';
-        const value = await localToRemote(ctx, auditId, def, text);
+        const value = await localToRemote(ctx, auditId, def, text, fresh);
+        if (value === undefined) continue;
         if (isEmptyValue(value) && !isEmptyValue(fresh[def.field]) && !(await ctx.confirmEmpty(def.key, 'push'))) {
             throw new Error(`local section ${def.key} is empty, refusing to blank it on PwnDoc`);
         }
@@ -534,8 +570,6 @@ async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapsho
 // Local only: returns the new note text, the caller writes it
 async function pullSections(ctx, { auditId, findingId, noteMd, sections }) {
     const defs = sections.map(defOf);
-    const ro = defs.find(d => d.readOnly);
-    if (ro) throw new Error(`section ${ro.key} is read-only`);
     const { finding: fresh } = await fetchFinding(ctx, auditId, findingId);
     const secs = parseSections(noteMd);
     let md = noteMd;
@@ -543,14 +577,14 @@ async function pullSections(ctx, { auditId, findingId, noteMd, sections }) {
     const baseSections = {};
     for (const def of defs) {
         if (def.source) {
-            meta[def.key] = String(fresh[def.field] ?? '');
-            baseSections[def.key] = def.key === 'title' ? sanitizeTitle(meta[def.key]) : meta[def.key].trim();
+            meta[def.key] = def.cmpRemote ? def.cmpRemote(fresh[def.field]) : String(fresh[def.field] ?? '');
+            baseSections[def.key] = def.cmpRemote ? meta[def.key] : def.key === 'title' ? sanitizeTitle(meta[def.key]) : meta[def.key].trim();
             continue;
         }
         if (isEmptyValue(fresh[def.field]) && (secs[def.key]?.text || '') !== '' && !(await ctx.confirmEmpty(def.key, 'pull'))) {
             throw new Error(`PwnDoc section ${def.key} is empty, refusing to blank it in the note`);
         }
-        const text = await remoteToLocal(ctx, def, fresh[def.field]);
+        const text = await remoteToLocal(ctx, def, fresh[def.field], fresh);
         md = replaceSection(md, def.key, text);
         baseSections[def.key] = await comparisonForm(ctx, def, text);
     }
@@ -569,8 +603,9 @@ function restoreRemotePatch(snapshotFinding, sections) {
     const patch = {};
     for (const key of sections) {
         const def = defOf(key);
-        if (def.readOnly) throw new Error(`section ${key} is read-only`);
-        patch[def.field] = snapshotFinding?.[def.field] ?? (def.kind === 'list' ? [] : '');
+        const v = snapshotFinding?.[def.field];
+        if (v === undefined && def.cmpRemote) continue; // the snapshot never had this field
+        patch[def.field] = v ?? (def.kind === 'list' || def.kind === 'custom' ? [] : '');
     }
     return patch;
 }
@@ -581,6 +616,8 @@ function restoreLocal(noteMd, snapshotMd, sections) {
 }
 
 async function remoteForm(ctx, def, value) {
+    if (def.cmpRemote) return def.cmpRemote(value);
+    if (def.kind === 'custom') return renderCustomFields({ customFields: value || [] }, ctx);
     if (def.kind === 'html') return ctx.normalize(ctx.htmlToMd(value || ''));
     if (def.kind === 'list') return (value || []).map(s => s.trim()).filter(Boolean).join('\n');
     return String(value ?? '').trim();
@@ -625,6 +662,69 @@ async function rollbackSections(ctx, { entry, side, sections, noteMd, auditId, f
     }, ctx.historyLimit);
     await ctx.api('PUT', `/api/audits/${auditId}/findings/${findingId}`, { body: patch });
     return { entryId };
+}
+
+// ── Custom fields, completion status, frontmatter of pulled fields ────────────
+// ponytail: a value line that is only **bold** reads as a new label
+function parseCustomFieldsText(text) {
+    const out = [];
+    for (const line of String(text || '').split('\n')) {
+        const m = line.match(/^\*\*(.+)\*\*\s*$/);
+        if (m) out.push({ label: m[1].trim(), lines: [] });
+        else if (out.length) out.at(-1).lines.push(line);
+    }
+    return out.map(c => ({ label: c.label, md: c.lines.join('\n').trim() }));
+}
+
+// The form renderCustomFields produces, so a note and PwnDoc compare equal when they say the same
+const canonCustom = text => parseCustomFieldsText(text).filter(c => c.md).flatMap(c => [`**${c.label}**`, '', c.md, '']).join('\n').trim();
+
+const PLAIN_CF_TYPES = ['input', 'date', 'radio', 'select'];
+
+// The customFields array to PUT: the finding's own entries, with the text of the ones named in the note replaced.
+// Rich text goes through the same markdown to HTML path as the body sections, input-like fields stay plain.
+async function customFieldsPatch(ctx, auditId, fresh, text) {
+    const entries = (fresh.customFields || []).map(cf => {
+        const id = cf.customField?._id ?? cf.customField;
+        return { id, label: ctx.cfLabels?.[id] || cf.customField?.label || '', type: cf.customField?.fieldType || ctx.cfTypes?.[id], text: cf.text };
+    });
+    for (const { label, md } of parseCustomFieldsText(text)) {
+        if (!md) continue;
+        let e = entries.find(x => x.label === label);
+        if (!e) {
+            const id = Object.keys(ctx.cfLabels || {}).find(k => ctx.cfLabels[k] === label);
+            if (!id) throw new Error(`unknown custom field "${label}"`);
+            entries.push(e = { id, label, type: ctx.cfTypes?.[id], text: '' });
+        }
+        if (e.type && e.type !== 'text' && !PLAIN_CF_TYPES.includes(e.type)) throw new Error(`custom field "${label}" (${e.type}) cannot be edited here`);
+        const rich = e.type ? e.type === 'text' : /<\/?\w+[^>]*>/.test(String(e.text ?? ''));
+        e.text = rich ? await ctx.mdToHtml(await tokenizeImages(ctx, auditId, md)) : md;
+    }
+    return entries.map(e => ({ customField: e.id, text: e.text }));
+}
+
+// Mark a finding completed or reopen it: patches only `status`, after the state guard, with a history entry
+async function setFindingStatus(ctx, { auditId, findingId, completed, force, localBefore = '' }) {
+    const { audit, finding: fresh } = await fetchFinding(ctx, auditId, findingId);
+    assertEditable(audit, force);
+    const ts = new Date().toISOString();
+    await recordHistory(ctx.adapter, ctx.historyDir, {
+        ts, op: 'status', forced: !!force && audit.state !== 'EDIT', auditId, findingId, notePath: ctx.notePath,
+        sections: ['status'], remoteBefore: fresh, localBefore,
+    }, ctx.historyLimit);
+    await ctx.api('PUT', `/api/audits/${auditId}/findings/${findingId}`, { body: { status: completed ? STATUS_DONE : STATUS_OPEN } });
+    await saveBase(ctx.adapter, ctx.historyDir, { ts, sections: { status: completed ? 'completed' : 'in progress' } });
+}
+
+// Frontmatter keys to write after a pull, from the codec form of the pulled fields
+function metaToFrontmatter(meta, fm = {}) {
+    const out = {};
+    for (const def of SECTION_DEFS) {
+        if (!def.toFm || meta[def.key] === undefined) continue;
+        const v = def.toFm(meta[def.key], fm[def.fmKey]);
+        if (v !== undefined) out[def.fmKey] = v;
+    }
+    return out;
 }
 
 // ── Title and CVSS (not body sections: they live in the file name and the frontmatter) ──
@@ -1648,7 +1748,7 @@ class MergeModal extends Modal {
 
         const ui = this.rows.map(row => {
             const def = SECTION_DEFS.find(d => d.key === row.key);
-            const locked = !!def.readOnly || !row.changed;
+            const locked = !row.changed;
             let value = locked ? 'skip'
                 : !this.defaultKeys.includes(row.key) ? 'skip'
                 : row.merge ? 'merge' : row.status === 'remote' ? 'pwndoc' : 'note';
@@ -1659,7 +1759,7 @@ class MergeModal extends Modal {
             head.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:10px;';
             head.createEl('strong', { text: labelOf(def) });
             head.createEl('small', {
-                text: [def.readOnly && row.changed ? 'read-only' : STATUS[row.status],
+                text: [STATUS[row.status],
                     row.localEmpty ? 'note empty' : '', row.remoteEmpty ? 'PwnDoc empty' : ''].filter(Boolean).join(' · '),
                 cls: 'pwndoc-meta',
             });
@@ -1819,8 +1919,8 @@ class RollbackModal extends Modal {
             const box = contentEl.createEl('div');
             const head = box.createEl('label');
             const check = head.createEl('input', { type: 'checkbox' });
-            check.checked = row.changed && !def.readOnly && this.entry.sections.includes(row.key);
-            check.disabled = !row.changed || !!def.readOnly;
+            check.checked = row.changed && this.entry.sections.includes(row.key);
+            check.disabled = !row.changed;
             head.createEl('strong', { text: ` ${labelOf(def)} ` });
             head.createEl('small', { text: row.changed ? 'differs from the snapshot' : 'same as the snapshot', cls: 'pwndoc-meta' });
             if (row.changed) {
@@ -2655,7 +2755,7 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
+module.exports.__test = { STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
     sideBySide, missingFindings, findingToNoteRow, IMPORT_SECTIONS, folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,
