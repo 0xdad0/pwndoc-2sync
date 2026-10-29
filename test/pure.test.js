@@ -53,3 +53,49 @@ test('migratePassword leaves settings alone when no plaintext password', () => {
     assert.deepEqual(calls, []);
     assert.equal('apiPassword' in out, false);
 });
+
+const NOTE = [
+    '---', 'severity: HIGH', 'pwndoc: true', '---', '',
+    '', '---', '## Descrizione', '', 'desc text', '',
+    '## Impatto', '', 'impact text', '',
+    '## Evidenza', '', 'evidence **bold**', '', '```', '## not a heading', '```', '',
+    '## Assets', '', 'asset1', '',
+    '## Remediation', '', 'fix it', '',
+    '## References', '', 'http://x', '',
+].join('\n');
+
+test('parseSections extracts each known section body', () => {
+    const s = T.parseSections(NOTE);
+    assert.equal(s.description.text, 'desc text');
+    assert.equal(s.observation.text, 'impact text');
+    assert.equal(s.scope.text, 'asset1');
+    assert.equal(s.remediation.text, 'fix it');
+    assert.equal(s.references.text, 'http://x');
+});
+
+test('parseSections keeps a heading-like line inside a code fence in the section', () => {
+    const s = T.parseSections(NOTE);
+    assert.equal(s.poc.text, 'evidence **bold**\n\n```\n## not a heading\n```');
+});
+
+test('parseSections accepts alias headings case-insensitively', () => {
+    const s = T.parseSections('## evidence\n\nx\n');
+    assert.equal(s.poc.text, 'x');
+});
+
+test('replaceSection changes only the target section', () => {
+    const out = T.replaceSection(NOTE, 'poc', 'NEW');
+    const before = T.parseSections(NOTE), after = T.parseSections(out);
+    assert.equal(after.poc.text, 'NEW');
+    for (const k of ['description', 'observation', 'scope', 'remediation', 'references']) {
+        assert.equal(after[k].text, before[k].text);
+    }
+    assert.equal(out.slice(0, before.poc.start), NOTE.slice(0, before.poc.start));
+});
+
+test('replaceSection appends the section when missing', () => {
+    const out = T.replaceSection('## Descrizione\n\nd\n', 'poc', 'E');
+    assert.equal(T.parseSections(out).poc.text, 'E');
+    assert.equal(T.parseSections(out).description.text, 'd');
+    assert.match(out, /## Evidenza/);
+});

@@ -97,6 +97,63 @@ function computeCVSS31(vector) {
     return { score, severity };
 }
 
+// ── Note sections ─────────────────────────────────────────────────────────────
+const SECTION_DEFS = [
+    { key: 'description',  field: 'description',  kind: 'html',   aliases: ['Descrizione', 'Description'] },
+    { key: 'observation',  field: 'observation',  kind: 'html',   aliases: ['Impatto', 'Impact', 'Observation'] },
+    { key: 'poc',          field: 'poc',          kind: 'html',   aliases: ['Evidenza', 'Evidenze', 'Evidence', 'Proof'] },
+    { key: 'scope',        field: 'scope',        kind: 'text',   aliases: ['Assets'] },
+    { key: 'remediation',  field: 'remediation',  kind: 'html',   aliases: ['Remediation'] },
+    { key: 'references',   field: 'references',   kind: 'list',   aliases: ['References'] },
+    { key: 'customFields', field: 'customFields', kind: 'custom', aliases: ['Custom Fields'] },
+];
+const DEFAULT_SYNC_SECTIONS = ['poc'];
+const ALIAS_TO_KEY = new Map(SECTION_DEFS.flatMap(d => d.aliases.map(a => [a.toLowerCase(), d.key])));
+
+// Level-2 headings outside code fences, with the offsets where the heading line and its body start
+function scanHeadings(md) {
+    const heads = [];
+    let fence = null;
+    let off = 0;
+    for (const line of md.split('\n')) {
+        const lineEnd = off + line.length + 1;
+        const f = line.match(/^\s*(```+|~~~+)/);
+        if (f) {
+            if (!fence) fence = f[1][0];
+            else if (f[1][0] === fence) fence = null;
+        } else if (!fence) {
+            const h = line.match(/^## +(.+?)\s*$/);
+            if (h) heads.push({ title: h[1], lineStart: off, bodyStart: Math.min(lineEnd, md.length) });
+        }
+        off = lineEnd;
+    }
+    return heads;
+}
+
+// { key: { text, start, end } } where [start, end) is the raw body region (heading excluded)
+function parseSections(md) {
+    const heads = scanHeadings(md);
+    const out = {};
+    heads.forEach((h, i) => {
+        const key = ALIAS_TO_KEY.get(h.title.toLowerCase());
+        if (!key || out[key]) return;
+        const end = i + 1 < heads.length ? heads[i + 1].lineStart : md.length;
+        out[key] = { text: md.slice(h.bodyStart, end).trim(), start: h.bodyStart, end };
+    });
+    return out;
+}
+
+function replaceSection(md, key, newText) {
+    const sec = parseSections(md)[key];
+    const body = newText.trim();
+    if (!sec) {
+        const title = SECTION_DEFS.find(d => d.key === key).aliases[0];
+        return md.replace(/\n*$/, '\n\n') + `## ${title}\n\n${body}\n`;
+    }
+    const atEof = sec.end >= md.length;
+    return md.slice(0, sec.start) + '\n' + (body ? body + '\n' : '') + (atEof ? '' : '\n') + md.slice(sec.end);
+}
+
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
 async function readFilePath(app, filePath) {
     if (/^([A-Za-z]:[\\/]|\/)/.test(filePath)) {
@@ -1079,4 +1136,4 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { pwndocApi, migratePassword, SECRET_ID };
+module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection };
