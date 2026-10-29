@@ -90,6 +90,8 @@ const SECTION_DEFS = [
     { key: 'remediation',  field: 'remediation',  kind: 'html',   aliases: ['Remediation'] },
     { key: 'references',   field: 'references',   kind: 'list',   aliases: ['References'] },
     { key: 'customFields', field: 'customFields', kind: 'custom', aliases: ['Custom Fields'], readOnly: true }, // shown in the diff, never pushed or pulled
+    { key: 'title',  field: 'title',  kind: 'text', aliases: [], label: 'Title',       source: 'filename' },
+    { key: 'cvssv3', field: 'cvssv3', kind: 'text', aliases: [], label: 'CVSS vector', source: 'frontmatter', fmKey: 'cvss_vector' },
 ];
 const DEFAULT_SYNC_SECTIONS = ['poc'];
 const ALIAS_TO_KEY = new Map(SECTION_DEFS.flatMap(d => d.aliases.map(a => [a.toLowerCase(), d.key])));
@@ -366,12 +368,12 @@ const listLines = text => text.split(/\n|; /).map(l => l.replace(/^\s*[-*]\s+/, 
 
 // ctx: { normalize(md) -> Promise<string>, htmlToMd(html) -> string, cfLabels }
 // One row per requested section: local and remote in comparison form, plus emptiness flags used to guard overwrites
-async function buildComparison(ctx, noteMd, finding, keys) {
+async function buildComparison(ctx, noteMd, finding, keys, noteInfo = {}) {
     const secs = parseSections(noteMd);
     const rows = [];
     for (const key of keys) {
         const def = SECTION_DEFS.find(d => d.key === key);
-        const localRaw = secs[key]?.text || '';
+        const localRaw = def.source ? localValue({ ...noteInfo, md: noteMd }, def) : secs[key]?.text || '';
         let local, remote;
         if (def.kind === 'html') {
             local = await ctx.normalize(localRaw);
@@ -462,6 +464,12 @@ function isEmptyValue(v) {
 const defOf = key => SECTION_DEFS.find(d => d.key === key);
 
 async function localToRemote(ctx, auditId, def, text) {
+    if (def.key === 'cvssv3' && text && !isValidCvss31(text)) throw new Error(`invalid CVSS vector: ${text}`);
+    const v = await localToRemoteBase(ctx, auditId, def, text);
+    return def.key === 'title' ? v.replace(FILENAME_UNSAFE_RE, '-') : v;
+}
+
+async function localToRemoteBase(ctx, auditId, def, text) {
     if (def.kind === 'html') return text === '' ? '' : ctx.mdToHtml(await tokenizeImages(ctx, auditId, text));
     if (def.kind === 'list') return listLines(text).split('\n').filter(Boolean);
     return text.trim();
@@ -500,7 +508,7 @@ async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapsho
     const patch = {};
     const baseSections = {};
     for (const def of defs) {
-        const text = secs[def.key]?.text || '';
+        const text = def.source ? localValue({ ...ctx.noteInfo, md: noteMd }, def) : secs[def.key]?.text || '';
         if (text === '' && !isEmptyValue(fresh[def.field]) && !(await ctx.confirmEmpty(def.key, 'push'))) {
             throw new Error(`local section ${def.key} is empty, refusing to blank it on PwnDoc`);
         }
@@ -525,8 +533,14 @@ async function pullSections(ctx, { auditId, findingId, noteMd, sections }) {
     const { finding: fresh } = await fetchFinding(ctx, auditId, findingId);
     const secs = parseSections(noteMd);
     let md = noteMd;
+    const meta = {};
     const baseSections = {};
     for (const def of defs) {
+        if (def.source) {
+            meta[def.key] = String(fresh[def.field] ?? '');
+            baseSections[def.key] = meta[def.key].trim();
+            continue;
+        }
         if (isEmptyValue(fresh[def.field]) && (secs[def.key]?.text || '') !== '' && !(await ctx.confirmEmpty(def.key, 'pull'))) {
             throw new Error(`PwnDoc section ${def.key} is empty, refusing to blank it in the note`);
         }
@@ -540,7 +554,7 @@ async function pullSections(ctx, { auditId, findingId, noteMd, sections }) {
         sections, remoteBefore: fresh, localBefore: noteMd,
     }, ctx.historyLimit);
     await saveBase(ctx.adapter, ctx.historyDir, { ts, sections: baseSections });
-    return { noteMd: md, entryId };
+    return { noteMd: md, entryId, meta };
 }
 
 // ── Rollback ──────────────────────────────────────────────────────────────────
@@ -605,6 +619,30 @@ async function rollbackSections(ctx, { entry, side, sections, noteMd, auditId, f
     }, ctx.historyLimit);
     await ctx.api('PUT', `/api/audits/${auditId}/findings/${findingId}`, { body: patch });
     return { entryId };
+}
+
+// ── Title and CVSS (not body sections: they live in the file name and the frontmatter) ──
+const FILENAME_UNSAFE_RE = /[\\/:*?"<>|]/g;
+const CVSS31_RE = /^CVSS:3\.1\/AV:[NALP]\/AC:[LH]\/PR:[NLH]\/UI:[NR]\/S:[UC]\/C:[NLH]\/I:[NLH]\/A:[NLH]$/;
+const isValidCvss31 = v => CVSS31_RE.test(v || '');
+const labelOf = def => def.label || def.aliases[0];
+
+// Same fields, in the same formats, that createVulnNote writes
+function cvssFrontmatter(vector) {
+    const { score, severity } = computeCVSS31(vector);
+    return {
+        severity,
+        cvss_vector: vector,
+        cvss_link: `https://www.first.org/cvss/calculator/3-1#${vector}`,
+        cvss_score: parseFloat(score),
+        cvss_severity: severity,
+    };
+}
+
+// info: { basename, fm, md }. Local value of a key that is not a heading section
+function localValue(info, def) {
+    if (def.source === 'filename') return titleFromBasename(info.basename || '');
+    return String(info.fm?.[def.fmKey] ?? '');
 }
 
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
@@ -1359,7 +1397,7 @@ class MergeModal extends Modal {
             const check = head.createEl('input', { type: 'checkbox' });
             check.checked = !def.readOnly && row.changed && this.defaultKeys.includes(row.key);
             check.disabled = !!def.readOnly || !row.changed;
-            head.createEl('strong', { text: ` ${def.aliases[0]} ` });
+            head.createEl('strong', { text: ` ${labelOf(def)} ` });
             head.createEl('small', {
                 text: !row.changed ? 'identical' : [def.readOnly ? 'read-only' : 'differs',
                     row.localEmpty ? 'note empty' : '', row.remoteEmpty ? 'PwnDoc empty' : ''].filter(Boolean).join(' · '),
@@ -1458,7 +1496,7 @@ class RollbackModal extends Modal {
             const check = head.createEl('input', { type: 'checkbox' });
             check.checked = row.changed && !def.readOnly && this.entry.sections.includes(row.key);
             check.disabled = !row.changed || !!def.readOnly;
-            head.createEl('strong', { text: ` ${def.aliases[0]} ` });
+            head.createEl('strong', { text: ` ${labelOf(def)} ` });
             head.createEl('small', { text: row.changed ? 'differs from the snapshot' : 'same as the snapshot', cls: 'pwndoc-meta' });
             if (row.changed) {
                 const det = box.createEl('details');
@@ -1772,6 +1810,7 @@ class PwnDocImporterPlugin extends Plugin {
         const adapter = app.vault.adapter;
         return {
             notePath: file.path,
+            noteInfo: { basename: file.basename, fm: app.metadataCache.getFileCache(file)?.frontmatter || {} },
             api: (m, p, o) => this.api(m, p, o),
             mdToHtml: md => mdToHtml(app, md),
             htmlToMd,
@@ -1794,8 +1833,8 @@ class PwnDocImporterPlugin extends Plugin {
             attachmentsFolder: this.settings.attachmentsFolder,
             confirmEmpty: (key, direction) => new Promise(resolve => new ConfirmModal(app,
                 direction === 'push'
-                    ? `The "${defOf(key).aliases[0]}" section of the note is empty but PwnDoc has content. Overwrite PwnDoc with an empty section?`
-                    : `PwnDoc has no content in "${defOf(key).aliases[0]}" but the note does. Overwrite the note section with an empty one?`,
+                    ? `The "${labelOf(defOf(key))}" section of the note is empty but PwnDoc has content. Overwrite PwnDoc with an empty section?`
+                    : `PwnDoc has no content in "${labelOf(defOf(key))}" but the note does. Overwrite the note section with an empty one?`,
                 resolve).open()),
         };
     }
@@ -1814,7 +1853,7 @@ class PwnDocImporterPlugin extends Plugin {
         try {
             ({ audit, finding } = await fetchFinding(ctx, auditId, findingId));
             noteMd = await this.app.vault.read(file);
-            rows = await buildComparison(ctx, noteMd, finding, SECTION_DEFS.map(d => d.key));
+            rows = await buildComparison(ctx, noteMd, finding, SECTION_DEFS.map(d => d.key), ctx.noteInfo);
         } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); return; }
 
         new MergeModal(this.app, rows, {
@@ -1828,6 +1867,7 @@ class PwnDocImporterPlugin extends Plugin {
                     if (pull.length) {
                         const r = await pullSections(ctx, { auditId, findingId, noteMd: await this.app.vault.read(file), sections: pull });
                         await this.app.vault.modify(file, r.noteMd);
+                        await this.applyPullMeta(file, r.meta);
                     }
                     new Notice(`PwnDoc Importer: pushed ${push.length}, pulled ${pull.length} section(s).`);
                 } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
@@ -1849,7 +1889,7 @@ class PwnDocImporterPlugin extends Plugin {
             try {
                 const { audit, finding } = await fetchFinding(ctx, auditId, findingId);
                 const noteMd = await this.app.vault.read(file);
-                const keys = SECTION_DEFS.map(d => d.key);
+                const keys = SECTION_DEFS.filter(d => side === 'remote' || !d.source).map(d => d.key);
                 const rows = await buildRollbackComparison(ctx, entry, side, finding, noteMd, keys);
                 new RollbackModal(this.app, rows, {
                     entry, side, auditState: audit.state,
@@ -1867,6 +1907,23 @@ class PwnDocImporterPlugin extends Plugin {
                 }).open();
             } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
         }).open();
+    }
+
+    // Title and CVSS pulled from PwnDoc: rename the note (keeping its VT-NN prefix) and refresh the frontmatter
+    async applyPullMeta(file, meta) {
+        if (meta.cvssv3 !== undefined) {
+            if (isValidCvss31(meta.cvssv3)) {
+                await this.app.fileManager.processFrontMatter(file, fm => Object.assign(fm, cvssFrontmatter(meta.cvssv3)));
+            } else new Notice(`PwnDoc Importer: PwnDoc CVSS "${meta.cvssv3}" is not a 3.1 vector, frontmatter left unchanged.`);
+        }
+        if (meta.title) {
+            const prefix = file.basename.match(/^(VT|M)-\d+ - /)?.[0] || '';
+            const dir = parentDir(file.path);
+            const target = normalizePath(`${dir ? dir + '/' : ''}${prefix}${meta.title.replace(FILENAME_UNSAFE_RE, '-')}.md`);
+            if (target === file.path) return;
+            if (this.app.vault.getAbstractFileByPath(target)) { new Notice(`PwnDoc Importer: cannot rename, "${target}" already exists.`); return; }
+            await this.app.fileManager.renameFile(file, target);
+        }
     }
 
     // Step 2 — ask VT or M
@@ -2021,6 +2078,6 @@ module.exports = PwnDocImporterPlugin;
 module.exports.__test = { pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
-    historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase,
+    isValidCvss31, cvssFrontmatter, localValue, labelOf, historyDir, pruneNames, recordHistory, listHistory, loadBase, saveBase,
     AuditLockedError, assertEditable, findingHash, assertUnchanged, isEmptyValue, pushSections, pullSections,
     restoreRemotePatch, restoreLocal, buildRollbackComparison, rollbackSections };

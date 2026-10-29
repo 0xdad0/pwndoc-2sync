@@ -537,3 +537,61 @@ test('buildRollbackComparison marks which sections differ from the snapshot', as
     const rows = await T.buildRollbackComparison(syncCtx(), entry, 'remote', cur, '', ['poc', 'description']);
     assert.deepEqual(rows.map(r => [r.key, r.changed]), [['poc', true], ['description', false]]);
 });
+
+// ── title and CVSS ────────────────────────────────────────────────────────────
+const V = 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H';
+
+test('isValidCvss31 accepts a full 3.1 vector and rejects other versions, missing and bad metrics', () => {
+    assert.equal(T.isValidCvss31(V), true);
+    assert.equal(T.isValidCvss31(V.replace('3.1', '3.0')), false);
+    assert.equal(T.isValidCvss31('CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H'), false);
+    assert.equal(T.isValidCvss31(V.replace('AV:N', 'AV:X')), false);
+    assert.equal(T.isValidCvss31(''), false);
+});
+
+test('cvssFrontmatter derives the same frontmatter fields as the importer', () => {
+    assert.deepEqual(T.cvssFrontmatter(V), {
+        severity: 'CRITICAL', cvss_vector: V, cvss_link: `https://www.first.org/cvss/calculator/3-1#${V}`, cvss_score: 9.8, cvss_severity: 'CRITICAL',
+    });
+});
+
+test('localValue reads the title from the file name and the CVSS vector from the frontmatter', () => {
+    const info = { basename: 'VT-03 - SQL Injection', fm: { cvss_vector: V }, md: '' };
+    assert.equal(T.localValue(info, T.SECTION_DEFS.find(d => d.key === 'title')), 'SQL Injection');
+    assert.equal(T.localValue(info, T.SECTION_DEFS.find(d => d.key === 'cvssv3')), V);
+    assert.equal(T.localValue({ ...info, fm: {} }, T.SECTION_DEFS.find(d => d.key === 'cvssv3')), '');
+});
+
+test('buildComparison includes title and CVSS rows when given the note info', async () => {
+    const info = { basename: 'VT-01 - New title', fm: { cvss_vector: V.replace('H/I:H/A:H', 'L/I:L/A:L') } };
+    const rows = await T.buildComparison(cmpCtx, '', { ...FINDING, title: 'Old title', cvssv3: V }, ['title', 'cvssv3'], info);
+    assert.deepEqual(rows.map(r => [r.key, r.changed]), [['title', true], ['cvssv3', true]]);
+});
+
+test('pushSections sends title and cvssv3 patches, sanitising the title', async () => {
+    const ctx = syncCtx();
+    ctx.noteInfo = { basename: 'VT-03 - A/B: new', fm: { cvss_vector: V.replace('S:U', 'S:C') } };
+    await T.pushSections(ctx, pushArgs(ctx, { sections: ['title', 'cvssv3'] }));
+    assert.deepEqual(ctx.log.puts[0].body, { title: 'A-B- new', cvssv3: V.replace('S:U', 'S:C') });
+});
+
+test('pushSections refuses an invalid CVSS vector before any write', async () => {
+    const ctx = syncCtx();
+    ctx.noteInfo = { basename: 'VT-03 - x', fm: { cvss_vector: 'CVSS:3.1/AV:N' } };
+    await assert.rejects(T.pushSections(ctx, pushArgs(ctx, { sections: ['cvssv3'] })), /invalid CVSS/);
+    assert.equal(ctx.log.puts.length, 0);
+    assert.equal((await T.listHistory(ctx.hist, ctx.historyDir)).length, 0);
+});
+
+test('pullSections returns title and CVSS as meta and leaves the note body alone', async () => {
+    const ctx = syncCtx({ remote: { title: 'Remote title', cvssv3: V } });
+    ctx.noteInfo = { basename: 'VT-03 - Old', fm: {} };
+    const note = '## Descrizione\n\nkeep\n';
+    const r = await T.pullSections(ctx, { auditId: AID, findingId: FID, noteMd: note, sections: ['title', 'cvssv3'], force: false });
+    assert.equal(r.noteMd, note);
+    assert.deepEqual(r.meta, { title: 'Remote title', cvssv3: V });
+});
+
+test('labelOf names every section, including title and CVSS which have no heading alias', () => {
+    assert.deepEqual(T.SECTION_DEFS.map(T.labelOf), ['Descrizione', 'Impatto', 'Evidenza', 'Assets', 'Remediation', 'References', 'Custom Fields', 'Title', 'CVSS vector']);
+});
