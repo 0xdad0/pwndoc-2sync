@@ -108,24 +108,26 @@ async function readFilePath(app, filePath) {
 // ── PwnDoc API client ─────────────────────────────────────────────────────────
 const PRIORITY_MAP_API = { 1: 'Low', 2: 'Medium', 3: 'High', 4: 'Critical' };
 
-function httpsRequest(urlStr, { method = 'GET', headers = {}, body = null, ignoreSsl = false } = {}) {
+function httpRequest(urlStr, { method = 'GET', headers = {}, body = null, ignoreSsl = false, raw = false } = {}) {
     return new Promise((resolve, reject) => {
-        const https = require('https');
         const url = new URL(urlStr);
+        const isHttps = url.protocol === 'https:';
+        const lib = require(isHttps ? 'https' : 'http');
         const options = {
             hostname: url.hostname,
-            port: url.port || 443,
+            port: url.port || (isHttps ? 443 : 80),
             path: url.pathname + url.search,
             method,
             headers,
-            rejectUnauthorized: !ignoreSsl,
         };
-        const req = https.request(options, res => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
+        if (isHttps) options.rejectUnauthorized = !ignoreSsl;
+        const req = lib.request(options, res => {
+            const chunks = [];
+            res.on('data', chunk => chunks.push(chunk));
             res.on('end', () => {
-                if (res.statusCode >= 200 && res.statusCode < 300) resolve(data);
-                else reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
+                const buf = Buffer.concat(chunks);
+                if (res.statusCode >= 200 && res.statusCode < 300) resolve(raw ? buf : buf.toString('utf8'));
+                else reject(new Error(`HTTP ${res.statusCode}: ${buf.toString('utf8').slice(0, 200)}`));
             });
         });
         req.on('error', reject);
@@ -134,10 +136,23 @@ function httpsRequest(urlStr, { method = 'GET', headers = {}, body = null, ignor
     });
 }
 
+// Generic authenticated call. Returns `datas` of the JSON envelope (or the raw Buffer with rawResponse).
+async function pwndocApi(baseUrl, token, method, path, { body, ignoreSsl = false, rawResponse = false } = {}) {
+    const headers = { 'Cookie': `token= JWT ${token}` };
+    let payload = null;
+    if (body !== undefined) {
+        payload = JSON.stringify(body);
+        headers['Content-Type'] = 'application/json';
+        headers['Content-Length'] = Buffer.byteLength(payload);
+    }
+    const res = await httpRequest(new URL(path, baseUrl).toString(), { method, headers, body: payload, ignoreSsl, raw: rawResponse });
+    return rawResponse ? res : JSON.parse(res)?.datas;
+}
+
 async function pwndocLogin(baseUrl, username, password, ignoreSsl) {
     const url = new URL('/api/users/token', baseUrl).toString();
     const body = JSON.stringify({ username, password, totpToken: '' });
-    const raw = await httpsRequest(url, {
+    const raw = await httpRequest(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
         body,
@@ -150,23 +165,11 @@ async function pwndocLogin(baseUrl, username, password, ignoreSsl) {
 }
 
 async function pwndocFetchVulns(baseUrl, token, ignoreSsl) {
-    const url = new URL('/api/vulnerabilities', baseUrl).toString();
-    const raw = await httpsRequest(url, {
-        headers: { 'Cookie': `token= JWT ${token}` },
-        ignoreSsl,
-    });
-    const data = JSON.parse(raw);
-    return data?.datas || [];
+    return (await pwndocApi(baseUrl, token, 'GET', '/api/vulnerabilities', { ignoreSsl })) || [];
 }
 
 async function pwndocFetchVulnDetail(baseUrl, token, id, ignoreSsl) {
-    const url = new URL(`/api/vulnerabilities/detail/${id}`, baseUrl).toString();
-    const raw = await httpsRequest(url, {
-        headers: { 'Cookie': `token= JWT ${token}` },
-        ignoreSsl,
-    });
-    const data = JSON.parse(raw);
-    return data?.datas || null;
+    return (await pwndocApi(baseUrl, token, 'GET', `/api/vulnerabilities/detail/${id}`, { ignoreSsl })) || null;
 }
 
 // Fetch full detail for every vuln in the list, N at a time
@@ -186,16 +189,11 @@ async function pwndocFetchAllDetails(baseUrl, token, ignoreSsl, list, dbg, onPro
 }
 
 async function pwndocFetchCustomFields(baseUrl, token, ignoreSsl, dbg) {
-    const url = new URL('/api/data/custom-fields', baseUrl).toString();
-    dbg('pwndocFetchCustomFields: GET', url);
-    const raw = await httpsRequest(url, {
-        headers: { 'Cookie': `token= JWT ${token}` },
-        ignoreSsl,
-    });
-    const data = JSON.parse(raw);
-    dbg('pwndocFetchCustomFields: raw datas', data?.datas);
+    dbg('pwndocFetchCustomFields: GET /api/data/custom-fields');
+    const datas = await pwndocApi(baseUrl, token, 'GET', '/api/data/custom-fields', { ignoreSsl });
+    dbg('pwndocFetchCustomFields: raw datas', datas);
     const map = {};
-    for (const cf of (data?.datas || [])) {
+    for (const cf of (datas || [])) {
         if (cf._id) {
             map[cf._id] = cf.label || cf._id;
             dbg(`  mapped ${cf._id} → "${map[cf._id]}" (label="${cf.label}")`);
@@ -1063,3 +1061,4 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
+module.exports.__test = { pwndocApi };
