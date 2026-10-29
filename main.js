@@ -262,6 +262,14 @@ function rankFindings(title, findings) {
 
 const pwndocListAudits = async (baseUrl, token, ignoreSsl) =>
     (await pwndocApi(baseUrl, token, 'GET', '/api/audits', { ignoreSsl })) || [];
+// What the "send to PwnDoc" picker offers: the findings best match first, plus "create a new one"
+// (on top when no finding has this title, since that is then the likely answer)
+function findingChoices(title, findings) {
+    const ranked = rankFindings(title, findings).map(finding => ({ finding }));
+    const exact = findings.some(f => normTitle(f.title) === normTitle(title));
+    return exact ? [...ranked, { create: true }] : [{ create: true }, ...ranked];
+}
+
 const pwndocGetAudit = (baseUrl, token, id, ignoreSsl) =>
     pwndocApi(baseUrl, token, 'GET', `/api/audits/${id}`, { ignoreSsl });
 
@@ -1874,6 +1882,30 @@ class FindingPickModal extends FuzzySuggestModal {
     onClose() { super.onClose(); setTimeout(() => { if (!this.chosen) this.onChoose(null); }, 0); }
 }
 
+// ── Modal: pick the finding to send a note to, or create it ───────────────────
+class FindingOrCreateModal extends SuggestModal {
+    constructor(app, findings, title, onChoose) {
+        super(app);
+        this.findings = findings;
+        this.title = title;
+        this.onChoose = onChoose; // ({ finding } | { create: true } | null) => void
+        this.chosen = false;
+        this.setPlaceholder('Finding of the engagement to send this note to, or create a new one...');
+    }
+    getSuggestions(q) {
+        const query = q.toLowerCase();
+        return findingChoices(this.title, this.findings)
+            .filter(c => c.create || `${c.finding.identifier} ${c.finding.title}`.toLowerCase().includes(query));
+    }
+    renderSuggestion(c, el) {
+        if (c.create) { el.createEl('div', { text: `+ Create a new finding "${this.title}" on PwnDoc` }); el.createEl('small', { text: 'from a library vulnerability or blank', cls: 'pwndoc-meta' }); return; }
+        el.createEl('div', { text: c.finding.title || c.finding._id });
+        el.createEl('small', { text: [`#${c.finding.identifier}`, c.finding.vulnType, c.finding.cvssv3].filter(Boolean).join(' · '), cls: 'pwndoc-meta' });
+    }
+    onChooseSuggestion(c) { this.chosen = true; this.onChoose(c); }
+    onClose() { super.onClose(); setTimeout(() => { if (!this.chosen) this.onChoose(null); }, 0); }
+}
+
 // ── Modal: yes/no confirmation ────────────────────────────────────────────────
 class ConfirmModal extends Modal {
     constructor(app, message, onAnswer) {
@@ -2419,6 +2451,7 @@ class PwnDocImporterPlugin extends Plugin {
             callback: () => this.refreshEngagementAttributes(),
         });
         const cmd = (id, name, callback) => this.addCommand({ id, name, callback });
+        cmd('send-to-pwndoc', 'Send note to PwnDoc (select or create the finding, then push)', () => this.sendToPwndoc());
         cmd('engagement-dashboard', 'Engagement dashboard (sync status of every note)', () => this.openDashboard());
         cmd('lint-note', 'Lint this note before pushing', () => this.lintCurrentNote());
         cmd('unlink-note', 'Unlink note from its PwnDoc finding', () => this.unlinkNote());
@@ -2733,8 +2766,7 @@ class PwnDocImporterPlugin extends Plugin {
             a = {
                 compare: act('git-compare', 'Compare with PwnDoc and merge', () => this.compareWithPwndoc()),
                 history: act('history', 'PwnDoc sync history (rollback)', () => this.rollbackFromHistory()),
-                link:    act('link', 'Associate note to PwnDoc finding', () => this.associateNote()),
-                create:  act('plus-circle', 'Create PwnDoc finding for this note', () => this.createFindingForNote()),
+                send:    act('upload-cloud', 'Send note to PwnDoc (select or create the finding)', () => this.sendToPwndoc()),
             };
             this.headerActions.set(view, a);
         }
@@ -2742,13 +2774,13 @@ class PwnDocImporterPlugin extends Plugin {
         const show = (el, v) => { el.style.display = v ? '' : 'none'; };
         show(a.compare, related && st.linked);
         show(a.history, related && st.linked);
-        show(a.link, related && !st.linked);
-        show(a.create, related && !st.linked);
+        show(a.send, related && !st.linked);
     }
 
     openQuickMenu(evt) {
         const menu = new Menu();
         const item = (title, icon, fn) => menu.addItem(i => i.setTitle(title).setIcon(icon).onClick(fn));
+        item('Send note to PwnDoc (select or create the finding)', 'upload-cloud', () => this.sendToPwndoc());
         item('Compare with PwnDoc and merge', 'git-compare', () => this.compareWithPwndoc());
         item('Associate note to finding', 'link', () => this.associateNote());
         item('Create PwnDoc finding for this note', 'plus-circle', () => this.createFindingForNote());
@@ -2773,6 +2805,30 @@ class PwnDocImporterPlugin extends Plugin {
         const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
         return resolveAuditId(file.path, fm, this.settings.folderAudits)
             ?? (await this.pickAudit())?._id ?? null;
+    }
+
+    // One entry point to get a note into PwnDoc: linked notes go straight to the compare, others first
+    // pick the finding of the engagement (best title match first) or create it, then the compare opens
+    // with Evidenza selected
+    async sendToPwndoc() {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) { new Notice('PwnDoc Importer: open a note first.'); return; }
+        if (this.app.metadataCache.getFileCache(file)?.frontmatter?.pwndoc_finding_id) return this.compareWithPwndoc();
+        try {
+            const auditId = await this.auditIdFor(file);
+            if (!auditId) return;
+            const audit = await this.api('GET', `/api/audits/${auditId}`);
+            const choice = await new Promise(r => new FindingOrCreateModal(this.app, audit.findings || [], titleFromBasename(file.basename), r).open());
+            if (!choice) return;
+            if (choice.create) return this.createFindingForNote(auditId);
+            await this.app.fileManager.processFrontMatter(file, fm => {
+                fm.pwndoc_audit_id = auditId;
+                fm.pwndoc_audit = audit.name;
+                fm.pwndoc_finding_id = choice.finding._id;
+            });
+            new Notice(`PwnDoc Importer: linked to "${choice.finding.title}"`);
+            await this.compareWithPwndoc({ auditId, findingId: choice.finding._id });
+        } catch (e) { new Notice(`PwnDoc Importer: ${e.message}`); console.error(e); }
     }
 
     async associateNote() {
@@ -2937,11 +2993,11 @@ class PwnDocImporterPlugin extends Plugin {
     }
 
     // Note without a finding: link an existing one with the same title, else create it from the library or from scratch
-    async createFindingForNote() {
+    async createFindingForNote(auditIdArg) {
         const file = this.app.workspace.getActiveFile();
         if (!file) { new Notice('PwnDoc Importer: open a note first.'); return; }
         const fm = this.app.metadataCache.getFileCache(file)?.frontmatter || {};
-        const auditId = await this.auditIdFor(file);
+        const auditId = auditIdArg ?? await this.auditIdFor(file);
         if (!auditId) return;
         const confirm = message => new Promise(resolve => new ConfirmModal(this.app, message, resolve).open());
         try {
@@ -3403,7 +3459,7 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
+module.exports.__test = { findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
     sideBySide, missingFindings, findingToNoteRow, IMPORT_SECTIONS, folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,

@@ -120,11 +120,25 @@ Three import commands are available from the command palette (`Ctrl+P` / `Cmd+P`
 
 Link notes to a PwnDoc **engagement (audit)**, compare them with the matching **finding** and merge section by section, in both directions. By default only the **Evidenza / proof of concept** section is selected, so evidence written in Obsidian can be pushed into a finding that is already populated on PwnDoc without touching the rest.
 
+### Recommended flow
+
+1. **Once per engagement:** *Associate folder to PwnDoc engagement* on the folder that holds its notes (right-click the folder). Every note in it shows the engagement in its properties.
+2. **Write the note** as usual (`VT-NN - Title` or `M-NN - Title`, from a library import or by hand). Put the evidence under `## Evidenza`; paste screenshots with *Paste clipboard image with numbered caption*.
+3. **Send it:** run **Send note to PwnDoc** (command, header button `upload-cloud`, or the status-bar menu).
+   - If the engagement is not known yet you are asked to pick it.
+   - You get the findings of the engagement, best title match first. Pick the one that is the same vulnerability, or choose **+ Create a new finding**: it is created from a library vulnerability (the one in `pwndoc_id` is suggested) or blank with the note title and CVSS.
+   - The note is linked (`pwndoc_finding_id`) and the compare opens with **Evidenza only** preselected, the other sections untouched. Check the side-by-side, press **Apply**: lint runs, then the section is pushed. Images are uploaded.
+4. **Next times** the same command opens the compare directly (the note is already linked). Use the **dashboard** to see every note of the engagement at once and push or pull Evidenza in bulk.
+5. **Close up:** *Mark PwnDoc finding as completed*, then *Generate PwnDoc report*. Every write is recorded in the history and can be rolled back.
+
+Nothing is written to PwnDoc before you press Apply (or confirm a status change); creating a finding is the only write that happens earlier, and it asks first. On an audit not in state `EDIT` every write needs **Enforce**.
+
 ### Associating notes
 
 | Command | What it does |
 |---|---|
 | **Associate folder to PwnDoc engagement** | Pick a vault folder (or right-click a folder in the file explorer) and an audit. Subfolders inherit it (nearest folder wins). Renaming the folder keeps the association. Every note the folder owns gets `pwndoc_audit_id` and `pwndoc_audit` (the engagement name) in its frontmatter, so it shows in the Properties panel and can be searched or used in Bases. Notes created or moved into the folder get it too; notes already linked to a finding of another engagement are left alone. |
+| **Send note to PwnDoc** | The single entry point: for a linked note it opens the compare, otherwise it asks for the finding (ranked by title) or creates it, links the note and opens the compare. The two commands below are the individual steps. |
 | **Associate note to PwnDoc finding** | Picks the finding of the audit (best title match first) and writes `pwndoc_audit_id` and `pwndoc_finding_id` in the frontmatter. If the audit has no finding with the note title it offers to create one. |
 | **Create PwnDoc finding for this note** | Links an existing finding with the same title, otherwise creates one from a **library vulnerability** (the one in `pwndoc_id` is suggested, any other can be picked) or a **blank** finding with the note title and CVSS. Then opens the compare with Evidenza selected. |
 
@@ -134,8 +148,8 @@ Link notes to a PwnDoc **engagement (audit)**, compare them with the matching **
 
 ### Quick actions
 
-- **Status bar:** for a note that belongs to an engagement it shows `PwnDoc: <engagement>` (with `· no finding` until the note is linked). Click it for a menu with compare, associate note, create finding, history, associate folder and refresh.
-- **Note header buttons:** compare/merge and history appear once the note is linked to a finding; link and create-finding appear while it is not.
+- **Status bar:** for a note that belongs to an engagement it shows `PwnDoc: <engagement>` (with `· no finding` until the note is linked). Click it for a menu with send to PwnDoc, compare, associate note, create finding, history, associate folder and refresh.
+- **Note header buttons:** compare/merge and history appear once the note is linked to a finding; **Send note to PwnDoc** (select or create the finding) appears while it is not.
 - **Refresh engagement attribute on notes** (command or status-bar menu) re-reads the engagement names from PwnDoc and rewrites the attribute on every associated folder, for example after renaming an audit.
 
 ### Compare and merge

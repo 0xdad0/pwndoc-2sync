@@ -1210,3 +1210,10 @@ test('lint ignores images and captions inside code fences', () => {
     const md = '## Evidenza\n\n```\n![x](https://evil/x.png)\n*Figura 9 – dentro*\n```\n\n![](a.png)\n*Figura 1 – fuori*\n';
     assert.deepEqual(lintNote(md), []);
 });
+
+test('findingChoices ranks the audit findings by title and offers creation: first when nothing matches, last when a finding has the same title', () => {
+    const fs = [{ _id: 'a', title: 'SQL injection', identifier: 2 }, { _id: 'b', title: 'XSS', identifier: 1 }];
+    assert.deepEqual(T.findingChoices('XSS', fs).map(c => c.create ? 'create' : c.finding._id), ['b', 'a', 'create']);
+    assert.deepEqual(T.findingChoices('Open redirect', fs).map(c => c.create ? 'create' : c.finding._id), ['create', 'b', 'a']);
+    assert.deepEqual(T.findingChoices('Open redirect', []).map(c => !!c.create), [true]);
+});
