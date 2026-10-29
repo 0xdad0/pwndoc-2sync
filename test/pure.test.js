@@ -977,3 +977,131 @@ test('custom fields are no longer read-only: a push sends the merged array', asy
     await T.pushSections(ctx, pushArgs(ctx, { noteMd: '## Custom Fields\n\n**CWE**\n\nCWE-89\n', sections: ['customFields'] }));
     assert.deepEqual(ctx.log.puts[0].body.customFields.find(c => c.customField === 'cf1'), { customField: 'cf1', text: 'CWE-89' });
 });
+
+// ── lint, figures, dashboard, remote changes, orphans, report ─────────────────
+const lintNote = (md, o = {}) => T.lintNote(md, { sections: ['poc'], fm: {}, locale: 'IT-it', exists: () => true, ...o });
+const msgs = issues => issues.map(i => `${i.level}:${i.section}:${i.message}`);
+
+test('lint: a clean evidence section with numbered captions has no issues', () => {
+    const md = '## Evidenza\n\nTesto\n\n![](a.png)\n*Figura 1 – Login*\n\n![](b.png)\n*Figura 2 – Dashboard*\n';
+    assert.deepEqual(lintNote(md), []);
+});
+
+test('lint: missing file, remote image, missing caption, wrong number, wrong language, hyphen instead of en dash', () => {
+    const md = '## Evidenza\n\n![](gone.png)\n*Figura 1 – ok*\n\n![](http://x/y.png)\n\n![](c.png)\n*Figura 5 – salto*\n\n![](d.png)\n*Figure 4 – lingua*\n\n![](e.png)\n*Figura 5 - trattino*\n';
+    const m = msgs(lintNote(md, { exists: s => s !== 'gone.png' }));
+    assert.ok(m.includes('error:poc:missing image: gone.png'));
+    assert.ok(m.includes('error:poc:remote image not supported: http://x/y.png'));
+    assert.ok(m.includes('warn:poc:image without caption: http://x/y.png'));
+    assert.ok(m.some(x => /numbering/.test(x) && /expected 2, found 5/.test(x)));
+    assert.ok(m.some(x => /"Figure" in an IT-it note, expected "Figura"/.test(x)));
+    assert.ok(m.some(x => /en dash/.test(x)));
+});
+
+test('lint: empty selected section, conflict markers, unclosed fence, invalid CVSS and enum values', () => {
+    assert.deepEqual(msgs(lintNote('## Evidenza\n\n')), ['warn:poc:section is empty']);
+    assert.ok(msgs(lintNote('## Evidenza\n\n<<<<<<< local\nx\n=======\ny\n>>>>>>> pwndoc\n')).includes('error:poc:unresolved merge conflict markers'));
+    assert.ok(msgs(lintNote('## Evidenza\n\n```\ncode\n')).includes('error:poc:unclosed code fence'));
+    const m = msgs(lintNote('', { sections: ['cvssv3', 'priority', 'title'], fm: { cvss_vector: 'CVSS:3.1/AV:X', priority: 'banana' }, basename: 'VT-01 - ' }));
+    assert.deepEqual(m, ['error:cvssv3:invalid CVSS vector: CVSS:3.1/AV:X', 'error:priority:invalid Priority: banana', 'error:title:title is empty']);
+});
+
+test('lint only reports the sections in scope, but numbers captions across the whole note', () => {
+    const md = '## Descrizione\n\n![](a.png)\n*Figura 1 – a*\n\n## Evidenza\n\n![](b.png)\n*Figura 2 – b*\n';
+    assert.deepEqual(lintNote(md), []);
+    const bad = md.replace('Figura 2', 'Figura 3');
+    assert.ok(msgs(lintNote(bad)).some(x => /expected 2, found 3/.test(x)));
+    assert.deepEqual(lintNote(bad, { sections: ['description'] }), []);
+});
+
+test('nextFigureNumber and figureCaption follow the report convention of the note language', () => {
+    assert.equal(T.nextFigureNumber('## Evidenza\n\n*Figura 1 – a*\n\n*Figura 4 – b*'), 5);
+    assert.equal(T.nextFigureNumber(''), 1);
+    assert.equal(T.figureCaption('IT-it', 2, 'Login'), '*Figura 2 – Login*');
+    assert.equal(T.figureCaption('EN-en', 2, 'Login'), '*Figure 2 – Login*');
+    assert.equal(T.figureCaption('', 1, 'x'), '*Figure 1 – x*');
+});
+
+test('orphanReason: only linked notes can be orphans', () => {
+    const audit = { findings: [{ _id: 'f1' }] };
+    assert.equal(T.orphanReason({ pwndoc_finding_id: 'f1' }, audit), '');
+    assert.equal(T.orphanReason({ pwndoc_finding_id: 'f2' }, audit), 'finding not found in the engagement');
+    assert.equal(T.orphanReason({ pwndoc_finding_id: 'f1' }, null), 'engagement not found on PwnDoc');
+    assert.equal(T.orphanReason({}, audit), '');
+});
+
+test('watchedRows keeps the default sections and whatever has a base or content; remoteChanges lists the sections PwnDoc changed', () => {
+    const rows = [
+        { key: 'poc', localEmpty: true, base: undefined, status: 'unknown' },
+        { key: 'description', localEmpty: true, base: undefined, status: 'unknown' },
+        { key: 'remediation', localEmpty: false, base: 'x', status: 'remote' },
+        { key: 'scope', localEmpty: true, base: 'y', status: 'conflict' },
+        { key: 'title', localEmpty: false, base: 't', status: 'local' },
+    ];
+    assert.deepEqual(T.watchedRows(rows).map(r => r.key), ['poc', 'remediation', 'scope', 'title']);
+    assert.deepEqual(T.remoteChanges(rows), ['remediation', 'scope']);
+    assert.equal(T.overallState(T.watchedRows(rows)), 'conflict');
+    assert.equal(T.overallState([]), 'same');
+});
+
+test('buildDashboard sorts notes into synced, orphan and unlinked, and lists findings without a note', async () => {
+    const audit = { _id: 'A1', findings: [
+        { _id: 'f1', title: 'One', status: T.STATUS_DONE, poc: '<p>remote poc</p>', description: '', observation: '', scope: '', remediation: '', references: [], customFields: [] },
+        { _id: 'f2', title: 'Two', status: T.STATUS_OPEN, poc: '', description: '', observation: '', scope: '', remediation: '', references: [], customFields: [] },
+    ] };
+    const notes = [
+        { path: 'a.md', basename: 'VT-01 - One', fm: { pwndoc_finding_id: 'f1' }, md: '## Evidenza\n\nlocal poc\n' },
+        { path: 'b.md', basename: 'VT-02 - Gone', fm: { pwndoc_finding_id: 'zz' }, md: '' },
+        { path: 'c.md', basename: 'VT-03 - New', fm: {}, md: '' },
+    ];
+    const d = await T.buildDashboard(cmpCtx, { audit, notes, linkedIds: new Set(['f1', 'zz']), loadBase: async () => null });
+    assert.equal(d.rows.length, 1);
+    assert.equal(d.rows[0].path, 'a.md');
+    assert.equal(d.rows[0].completed, true);
+    assert.equal(d.rows[0].state, 'unknown');
+    assert.deepEqual(d.rows[0].changed, ['poc']);
+    assert.deepEqual(d.orphans, [{ path: 'b.md', findingId: 'zz', reason: 'finding not found in the engagement' }]);
+    assert.deepEqual(d.unlinked.map(n => n.path), ['c.md']);
+    assert.deepEqual(d.missing.map(f => f._id), ['f2']);
+});
+
+test('generateReport uses the audit template, or switches to another one and puts the original back', async () => {
+    const calls = [];
+    const api = tpl => async (method, path, opts) => {
+        calls.push([method, path, opts?.body]);
+        if (path === '/api/audits/A1') return { _id: 'A1', name: 'Acme: web', state: 'EDIT', template: { _id: 't1' } };
+        if (path === '/api/templates') return [{ _id: 't1', name: 'Std', ext: 'docx' }, { _id: 't2', name: 'Short', ext: 'odt' }];
+        if (path === '/api/audits/A1/generate') return Buffer.from('DOC');
+        return 'ok';
+    };
+    let r = await T.generateReport({ api: api() }, { auditId: 'A1' });
+    assert.equal(r.buf.toString(), 'DOC');
+    assert.equal(r.ext, 'docx');
+    assert.equal(calls.filter(c => c[0] === 'PUT').length, 0);
+
+    calls.length = 0;
+    r = await T.generateReport({ api: api() }, { auditId: 'A1', templateId: 't2' });
+    assert.equal(r.ext, 'odt');
+    assert.deepEqual(calls.filter(c => c[0] === 'PUT').map(c => c[2]), [{ template: 't2' }, { template: 't1' }]);
+    assert.deepEqual(calls.map(c => c[1]).filter(p => p.endsWith('generate')), ['/api/audits/A1/generate']);
+});
+
+test('generateReport restores the template even when generation fails, and refuses to switch on a locked audit', async () => {
+    const puts = [];
+    const api = async (method, path, opts) => {
+        if (path === '/api/audits/A1') return { state: 'EDIT', template: 't1' };
+        if (path === '/api/templates') return [{ _id: 't1', ext: 'docx' }, { _id: 't2', ext: 'docx' }];
+        if (method === 'PUT') { puts.push(opts.body.template); return 'ok'; }
+        throw new Error('HTTP 500: boom');
+    };
+    await assert.rejects(T.generateReport({ api }, { auditId: 'A1', templateId: 't2' }), /HTTP 500/);
+    assert.deepEqual(puts, ['t2', 't1']);
+    const locked = async (m, p) => (p === '/api/audits/A1' ? { state: 'APPROVED', template: 't1' } : p === '/api/templates' ? [] : 'x');
+    await assert.rejects(T.generateReport({ api: locked }, { auditId: 'A1', templateId: 't2' }), /not EDIT/);
+    await assert.rejects(T.generateReport({ api: async (m, p) => (p === '/api/templates' ? [] : { state: 'EDIT' }) }, { auditId: 'A1' }), /no report template/);
+});
+
+test('reportFileName strips what a path cannot hold; pastedImageName is unique per note and time', () => {
+    assert.equal(T.reportFileName('Acme: web/app', 'docx', new Date('2026-10-29T10:00:00Z')), 'Acme- web-app - 2026-10-29.docx');
+    assert.equal(T.pastedImageName('VT-01 - XSS', new Date('2026-10-29T10:11:12Z')), 'VT-01 - XSS 20261029101112.png');
+});

@@ -419,7 +419,7 @@ async function buildComparison(ctx, noteMd, finding, keys, noteInfo = {}, base =
         const baseText = base?.sections?.[key];
         const status = classify(baseText, local, remote);
         const merge = status === 'conflict' && !def.source ? merge3(baseText, local, remote) : null;
-        rows.push({ key, local, remote, base: baseText, status, merge, changed: local !== remote, localEmpty: local === '', remoteEmpty: remote === '', diff: lineDiff(remote, local) });
+        rows.push({ key, local, remote, base: baseText, status, merge, changed: local !== remote, localEmpty: def.cmpLocal ? String(localRaw ?? '').trim() === '' : local === '', remoteEmpty: remote === '', diff: lineDiff(remote, local) });
     }
     return rows;
 }
@@ -972,6 +972,119 @@ const findingToNoteRow = (finding, audit) => ({
 });
 
 const IMPORT_SECTIONS = ['description', 'observation', 'poc', 'scope', 'remediation', 'references'];
+
+// ── Lint before a push, figures ───────────────────────────────────────────────
+const CAPTION_RE = /^\*(Figura|Figure)\s+(\d+)\s*([–—-])\s*(.+?)\*\s*$/;
+const captionWord = locale => (/^IT/i.test(locale || '') ? 'Figura' : /^EN/i.test(locale || '') ? 'Figure' : null);
+const figureCaption = (locale, n, text) => `*${captionWord(locale) || 'Figure'} ${n} – ${text}*`;
+const nextFigureNumber = md => Math.max(0, ...md.split('\n').map(l => +(l.match(CAPTION_RE)?.[2] ?? 0))) + 1;
+
+const fenceOpen = text => {
+    let fence = null;
+    for (const line of text.split('\n')) {
+        const f = line.match(/^\s*(```+|~~~+)/);
+        if (f) fence = !fence ? f[1][0] : f[1][0] === fence ? null : fence;
+    }
+    return !!fence;
+};
+
+// Problems that make a push wrong ('error', the push is blocked) or sloppy ('warn', the user may go on).
+// opts: { sections: keys about to be pushed, fm, basename, locale, exists(src) -> bool }
+function lintNote(md, { sections, fm = {}, basename = '', locale = '', exists = () => true }) {
+    const issues = [];
+    const add = (level, section, message) => issues.push({ level, section, message });
+    const secs = parseSections(md);
+    const word = captionWord(locale);
+
+    // caption numbering runs through the whole note, in document order, whatever is being pushed
+    const captions = Object.entries(secs).sort((a, b) => a[1].start - b[1].start)
+        .flatMap(([key, s]) => mapOutsideFences(s.text, t => t).split('\n').map(l => ({ key, m: l.match(CAPTION_RE) })).filter(c => c.m));
+    captions.forEach(({ key, m }, i) => {
+        if (!sections.includes(key)) return;
+        if (+m[2] !== i + 1) add('warn', key, `figure numbering: expected ${i + 1}, found ${m[2]}`);
+        if (word && m[1] !== word) add('warn', key, `"${m[1]}" in an ${locale} note, expected "${word}"`);
+        if (m[3] !== '–') add('warn', key, `caption "${m[0].slice(0, 30)}": use an en dash (–) after the number`);
+    });
+
+    for (const key of sections) {
+        const def = defOf(key);
+        if (def.source) {
+            if (key === 'title' && !titleFromBasename(basename).trim()) add('error', key, 'title is empty');
+            if (key === 'cvssv3') { const v = String(fm[def.fmKey] ?? ''); if (v && !isValidCvss31(v)) add('error', key, `invalid CVSS vector: ${v}`); }
+            if (def.toRemote) { const raw = fm[def.fmKey]; if (def.toRemote(def.cmpLocal(raw ?? '')) === undefined && def.cmpLocal(raw ?? '') !== '') add('error', key, `invalid ${labelOf(def)}: ${raw}`); }
+            continue;
+        }
+        const text = secs[key]?.text || '';
+        if (text === '') add('warn', key, 'section is empty');
+        if (hasConflictMarkers(text)) add('error', key, 'unresolved merge conflict markers');
+        if (fenceOpen(text)) add('error', key, 'unclosed code fence');
+        if (def.kind !== 'html') continue;
+        const lines = text.split('\n');
+        lines.forEach((line, i) => {
+            for (const r of extractImageRefs(line)) {
+                if (r.remote) { add('error', key, `remote image not supported: ${r.src}`); }
+                else if (!exists(r.src)) add('error', key, `missing image: ${r.src}`);
+                const next = lines.slice(i + 1).find(l => l.trim() !== '');
+                if (!CAPTION_RE.test(next || '')) add('warn', key, `image without caption: ${r.src}`);
+            }
+        });
+    }
+    return issues;
+}
+
+// ── Dashboard, remote changes, orphans ────────────────────────────────────────
+const STATE_RANK = { same: 0, unknown: 1, remote: 2, local: 3, conflict: 4 };
+const overallState = rows => rows.reduce((s, r) => (STATE_RANK[r.status] > STATE_RANK[s] ? r.status : s), 'same');
+
+// The rows worth looking at: the default sections always, the others once they have content or a synced base
+const watchedRows = rows => rows.filter(r => DEFAULT_SYNC_SECTIONS.includes(r.key) || r.base !== undefined || !r.localEmpty);
+const remoteChanges = rows => watchedRows(rows).filter(r => r.status === 'remote' || r.status === 'conflict').map(r => r.key);
+
+const orphanReason = (fm, audit) => !fm?.pwndoc_finding_id ? ''
+    : !audit ? 'engagement not found on PwnDoc'
+    : (audit.findings || []).some(f => f._id === fm.pwndoc_finding_id) ? '' : 'finding not found in the engagement';
+
+// notes: [{ path, basename, fm, md }] of this engagement. One row per linked note, plus what does not pair up.
+async function buildDashboard(ctx, { audit, notes, linkedIds, loadBase }) {
+    const out = { rows: [], orphans: [], unlinked: [], missing: missingFindings(audit, linkedIds) };
+    const keys = SECTION_DEFS.map(d => d.key);
+    for (const n of notes) {
+        const findingId = n.fm?.pwndoc_finding_id;
+        if (!findingId) { out.unlinked.push(n); continue; }
+        const finding = audit.findings?.find(f => f._id === findingId);
+        if (!finding) { out.orphans.push({ path: n.path, findingId, reason: orphanReason(n.fm, audit) }); continue; }
+        const rows = watchedRows(await buildComparison(ctx, n.md, finding, keys, { basename: n.basename, fm: n.fm }, await loadBase(findingId)));
+        out.rows.push({
+            path: n.path, findingId, title: finding.title, completed: finding.status === STATUS_DONE,
+            state: overallState(rows), changed: rows.filter(r => r.changed).map(r => r.key),
+        });
+    }
+    return out;
+}
+
+// ── Report generation ─────────────────────────────────────────────────────────
+// PwnDoc renders the audit with the template stored on the audit, so choosing another one means switching it for the
+// duration of the call and putting the original back afterwards, also when the generation fails.
+async function generateReport(ctx, { auditId, templateId, force }) {
+    const audit = await ctx.api('GET', `/api/audits/${auditId}`);
+    const templates = (await ctx.api('GET', '/api/templates')) || [];
+    const current = audit.template?._id ?? audit.template ?? null;
+    const chosen = templateId ?? current;
+    if (!chosen) throw new Error('no report template selected, and the audit has none');
+    const switched = chosen !== current;
+    if (switched) assertEditable(audit, force);
+    const put = template => ctx.api('PUT', `/api/audits/${auditId}/general`, { body: { template } });
+    if (switched) await put(chosen);
+    try {
+        const buf = await ctx.api('GET', `/api/audits/${auditId}/generate`, { rawResponse: true });
+        return { buf, ext: templates.find(t => t._id === chosen)?.ext || 'docx', auditName: audit.name };
+    } finally {
+        if (switched && current) await put(current);
+    }
+}
+
+const reportFileName = (auditName, ext, date = new Date()) => `${sanitizeTitle(auditName)} - ${date.toISOString().slice(0, 10)}.${ext}`;
+const pastedImageName = (basename, date = new Date()) => `${basename} ${date.toISOString().replace(/\D/g, '').slice(0, 14)}.png`;
 
 // ── Read file (absolute path or vault-relative) ───────────────────────────────
 async function readFilePath(app, filePath) {
@@ -2755,7 +2868,7 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
+module.exports.__test = { lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
     sideBySide, missingFindings, findingToNoteRow, IMPORT_SECTIONS, folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,
