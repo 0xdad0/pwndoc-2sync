@@ -1425,6 +1425,55 @@ test('parseLintRules reports every broken rule and keeps the good ones', () => {
     assert.match(T.parseLintRules('::: not yaml', () => { throw new Error('bad yaml'); }).errors[0], /bad yaml/);
 });
 
+// ── lint rules editor: pure parts ─────────────────────────────────────────────
+const JSON_OUT = v => JSON.stringify(v, null, 1);
+
+test('a rule may carry a comment: it is ignored by the lint', () => {
+    const r = rulesOf([{ in: 'note', match: 'x', comment: 'why this exists' }]);
+    assert.deepEqual(r.errors, []);
+    assert.equal(r.rules.length, 1);
+});
+
+test('rulesList gives the raw rules of a list or { rules }, and says why it cannot', () => {
+    assert.deepEqual(T.rulesList('[{"in":"note","match":"x"}]', JSON.parse), { list: [{ in: 'note', match: 'x' }] });
+    assert.deepEqual(T.rulesList('{"rules":[{"id":"a"}]}', JSON.parse), { list: [{ id: 'a' }] });
+    assert.deepEqual(T.rulesList('', () => null), { list: [] });
+    assert.match(T.rulesList('x', () => { throw new Error('bad yaml'); }).error, /bad yaml/);
+    assert.match(T.rulesList('x', () => ({ a: 1 })).error, /list/);
+});
+
+test('ruleError says what is wrong with one rule, even a disabled one', () => {
+    assert.equal(T.ruleError({ in: 'note', match: 'x' }), '');
+    assert.match(T.ruleError({ in: 'note', match: '(' }), /invalid regex/);
+    assert.match(T.ruleError({ in: 'nowhere', match: 'x', enabled: false }), /unknown target "nowhere"/);
+});
+
+const FORM = { id: 'no-test', enabled: true, level: 'error', comment: 'client rule', inText: 'filename, section:evidenza', mode: 'match', pattern: 'test',
+    message: 'No Test', when: { folder: 'Generali', file: '', path: '', title: '', engagement: '', fm: 'platform = WEB\nowner = ^me' }, unless: { folder: '', file: '', path: '', title: '', engagement: '', fm: '' } };
+
+test('formToRule writes only what is set, in a readable key order, and ruleToForm reads it back', () => {
+    const rule = T.formToRule(FORM);
+    assert.deepEqual(Object.keys(rule), ['id', 'level', 'in', 'match', 'message', 'when', 'comment']);
+    assert.deepEqual(rule.in, ['filename', 'section:evidenza']);
+    assert.deepEqual(rule.when, { folder: 'Generali', fm: { platform: 'WEB', owner: '^me' } });
+    assert.deepEqual(T.ruleToForm(rule), FORM);
+    assert.equal(T.formToRule({ ...FORM, inText: 'note', enabled: false, mode: 'missing' }).in, 'note');
+    assert.equal(T.formToRule({ ...FORM, enabled: false }).enabled, false);
+    assert.equal('enabled' in T.formToRule(FORM), false);
+    assert.throws(() => T.formToRule({ ...FORM, when: { ...FORM.when, fm: 'no equals sign' } }), /key = regex/);
+    assert.throws(() => T.formToRule({ ...FORM, pattern: '  ' }), /pattern is empty/);
+    assert.throws(() => T.formToRule({ ...FORM, inText: ' , ' }), /where to look/);
+});
+
+test('writeRulesText replaces only the yaml block of the note and keeps the prose', () => {
+    const md = '# Rules\n\nintro $1 $&\n\n```yaml\n[{"id":"old"}]\n```\n\ntail\n';
+    const out = T.writeRulesText(md, [{ id: 'new' }], JSON_OUT);
+    assert.ok(out.startsWith('# Rules\n\nintro $1 $&\n\n```yaml\n'));
+    assert.ok(out.endsWith('\n```\n\ntail\n'));
+    assert.deepEqual(T.rulesList(T.extractRulesText(out), JSON.parse).list, [{ id: 'new' }]);
+    assert.deepEqual(T.rulesList(T.writeRulesText('[]', [{ id: 'x' }], JSON_OUT), JSON.parse).list, [{ id: 'x' }]);
+});
+
 test('rule for one client: "Test" must not be in the file name when the folder contains Generali', () => {
     const rule = [{ level: 'error', in: 'filename', match: 'test', message: 'No "Test" in the file name for this client', when: { folder: 'Generali' } }];
     assert.deepEqual(run(rule).map(i => [i.level, i.section, i.where, i.message]), [['error', 'rule', 'filename', 'No "Test" in the file name for this client']]);

@@ -1,6 +1,6 @@
 'use strict';
 
-const { Plugin, PluginSettingTab, Setting, FuzzySuggestModal, SuggestModal, Modal, Notice, normalizePath, SecretComponent, Component, MarkdownRenderer, htmlToMarkdown, Menu, MarkdownView, parseYaml } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, FuzzySuggestModal, SuggestModal, Modal, Notice, normalizePath, SecretComponent, Component, MarkdownRenderer, htmlToMarkdown, Menu, MarkdownView, parseYaml, stringifyYaml } = require('obsidian');
 
 // ── CSV Parser ────────────────────────────────────────────────────────────────
 function parseCSV(text) {
@@ -1128,9 +1128,9 @@ function lintNote(md, { sections, fm = {}, basename = '', locale = '', exists = 
 //   missing  regex: a violation if the text does NOT match     }
 //   message  what to tell; {match} is the text found
 //   when / unless   conditions: folder, file, path, title, engagement (regex each), fm: { key: regex }
-//   id, enabled     optional
+//   id, enabled, comment     optional (comment is for the editor, the lint ignores it)
 // A regex is plain text (case-insensitive) or /re/flags (exact).
-const RULE_KEYS = new Set(['id', 'level', 'in', 'match', 'missing', 'message', 'when', 'unless', 'enabled']);
+const RULE_KEYS = new Set(['id', 'level', 'in', 'match', 'missing', 'message', 'when', 'unless', 'enabled', 'comment']);
 const COND_KEYS = new Set(['folder', 'file', 'path', 'title', 'engagement', 'fm']);
 const SIMPLE_TARGETS = new Set(['note', 'filename', 'title', 'path', 'frontmatter']);
 
@@ -1167,33 +1167,96 @@ function extractRulesText(md) {
     return m ? m[1] : md;
 }
 
+// One rule map -> compiled rule (throws with the reason); r.enabled is not looked at here
+function compileRule(r) {
+    if (typeof r !== 'object' || r === null) throw new Error('a rule must be a map');
+    for (const k of Object.keys(r)) if (!RULE_KEYS.has(k)) throw new Error(`unknown key "${k}"`);
+    const level = r.level ?? 'warn';
+    if (level !== 'error' && level !== 'warn') throw new Error(`level must be error or warn, not "${level}"`);
+    if (r.in == null) throw new Error('"in" is required');
+    if ((r.match == null) === (r.missing == null)) throw new Error('give exactly one of "match" and "missing"');
+    const targets = [].concat(r.in).map(compileTarget);
+    let re;
+    try { re = toRegex(r.match ?? r.missing); } catch (e) { throw new Error(`invalid regex: ${e.message}`); }
+    return {
+        id: r.id ? String(r.id) : '', level, targets, re, mode: r.match != null ? 'match' : 'missing',
+        message: r.message ? String(r.message) : null,
+        when: r.when ? compileCondition(r.when) : null, unless: r.unless ? compileCondition(r.unless) : null,
+    };
+}
+
 // -> { rules: compiled, errors: ["rule 3 (id): message"] }; a broken rule is reported and skipped, the others still run
 function parseLintRules(text, parseYaml) {
     const rules = [], errors = [];
-    let doc;
-    try { doc = parseYaml(text); } catch (e) { return { rules, errors: [`rules file: ${e.message}`] }; }
-    const list = Array.isArray(doc) ? doc : doc?.rules;
-    if (!Array.isArray(list)) return { rules, errors: doc == null ? [] : ['rules file: expected a list of rules, or "rules:" with a list'] };
+    const { list, error } = rulesList(text, parseYaml);
+    if (error) return { rules, errors: [error] };
     list.forEach((r, i) => {
         try {
-            if (typeof r !== 'object' || r === null) throw new Error('a rule must be a map');
-            if (r.enabled === false) return;
-            for (const k of Object.keys(r)) if (!RULE_KEYS.has(k)) throw new Error(`unknown key "${k}"`);
-            const level = r.level ?? 'warn';
-            if (level !== 'error' && level !== 'warn') throw new Error(`level must be error or warn, not "${level}"`);
-            if (r.in == null) throw new Error('"in" is required');
-            if ((r.match == null) === (r.missing == null)) throw new Error('give exactly one of "match" and "missing"');
-            const targets = [].concat(r.in).map(compileTarget);
-            let re;
-            try { re = toRegex(r.match ?? r.missing); } catch (e) { throw new Error(`invalid regex: ${e.message}`); }
-            rules.push({
-                id: r.id ? String(r.id) : '', level, targets, re, mode: r.match != null ? 'match' : 'missing',
-                message: r.message ? String(r.message) : null,
-                when: r.when ? compileCondition(r.when) : null, unless: r.unless ? compileCondition(r.unless) : null,
-            });
+            if (r?.enabled === false) return;
+            rules.push(compileRule(r));
         } catch (e) { errors.push(`rule ${i + 1}${r?.id ? ` (${r.id})` : ''}: ${e.message}`); }
     });
     return { rules, errors };
+}
+
+// The raw rules of the rules text (a list, or "rules:" with a list): { list } or { error }
+function rulesList(text, parseYaml) {
+    let doc;
+    try { doc = parseYaml(text); } catch (e) { return { error: `rules file: ${e.message}` }; }
+    const list = Array.isArray(doc) ? doc : doc?.rules;
+    if (Array.isArray(list)) return { list };
+    return doc == null ? { list: [] } : { error: 'rules file: expected a list of rules, or "rules:" with a list' };
+}
+
+// '' when the rule is fine (a disabled one is checked too), else the reason
+function ruleError(rule) {
+    try { compileRule(rule); return ''; } catch (e) { return e.message; }
+}
+
+// The note with the yaml block replaced by the rules; a file with no fence is all yaml, so it is rewritten whole
+function writeRulesText(md, list, stringify) {
+    const yaml = stringify(list).trimEnd();
+    return /```ya?ml[^\n]*\n[\s\S]*?\n```/.test(md)
+        ? md.replace(/(```ya?ml[^\n]*\n)[\s\S]*?(\n```)/, (_, open, close) => open + yaml + close)
+        : yaml + '\n';
+}
+
+// Editor form <-> rule. The form is all strings: inText is "a, b", fm is one "key = regex" per line.
+const COND_FIELDS = ['folder', 'file', 'path', 'title', 'engagement'];
+
+function condFromForm(c) {
+    const out = Object.fromEntries(COND_FIELDS.filter(k => c[k]?.trim()).map(k => [k, c[k].trim()]));
+    const fm = {};
+    for (const line of (c.fm || '').split('\n').map(l => l.trim()).filter(Boolean)) {
+        const i = line.indexOf('=');
+        if (i < 1) throw new Error(`"${line}": write frontmatter conditions as key = regex`);
+        fm[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+    }
+    return Object.keys(fm).length ? { ...out, fm } : out;
+}
+
+function condToForm(c) {
+    return { ...Object.fromEntries(COND_FIELDS.map(k => [k, String(c?.[k] ?? '')])), fm: Object.entries(c?.fm || {}).map(([k, v]) => `${k} = ${v}`).join('\n') };
+}
+
+function formToRule(f) {
+    const targets = f.inText.split(',').map(t => t.trim()).filter(Boolean);
+    if (!targets.length) throw new Error('say where to look ("in")');
+    if (!f.pattern.trim()) throw new Error('the pattern is empty');
+    const when = condFromForm(f.when), unless = condFromForm(f.unless);
+    return {
+        ...(f.id.trim() && { id: f.id.trim() }), ...(f.enabled === false && { enabled: false }), level: f.level,
+        in: targets.length === 1 ? targets[0] : targets, [f.mode]: f.pattern, ...(f.message.trim() && { message: f.message }),
+        ...(Object.keys(when).length && { when }), ...(Object.keys(unless).length && { unless }), ...(f.comment.trim() && { comment: f.comment.trim() }),
+    };
+}
+
+function ruleToForm(r) {
+    return {
+        id: String(r.id ?? ''), enabled: r.enabled !== false, level: r.level ?? 'warn', comment: String(r.comment ?? ''),
+        inText: [].concat(r.in ?? []).join(', '), mode: r.missing != null ? 'missing' : 'match', pattern: String(r.missing ?? r.match ?? ''),
+        message: String(r.message ?? ''), when: condToForm(r.when), unless: condToForm(r.unless),
+    };
 }
 
 const fmString = v => (v == null ? '' : Array.isArray(v) ? v.join(', ') : typeof v === 'object' ? JSON.stringify(v) : String(v));
@@ -1912,10 +1975,106 @@ class VaultFileSuggestModal extends FuzzySuggestModal {
 }
 
 // ── Settings tab ──────────────────────────────────────────────────────────────
+// ── Modal: edit one custom lint rule ──────────────────────────────────────────
+// rule: a rule map. onSubmit(rule) gets the new map; nothing is written here. Save stays off while the rule would not compile.
+class RuleModal extends Modal {
+    constructor(app, rule, onSubmit) {
+        super(app);
+        this.form = ruleToForm(rule);
+        this.onSubmit = onSubmit;
+    }
+    onOpen() {
+        const { contentEl, form } = this;
+        this.modalEl.style.width = 'min(640px, 95vw)';
+        contentEl.createEl('h3', { text: 'Lint rule' });
+        const row = (parent, label) => {
+            const r = parent.createEl('div');
+            r.style.cssText = 'display:flex;flex-direction:column;margin-bottom:8px;';
+            r.createEl('small', { text: label, cls: 'pwndoc-meta' });
+            return r;
+        };
+        const text = (parent, label, obj, key, { area = false, placeholder = '' } = {}) => {
+            const el = row(parent, label).createEl(area ? 'textarea' : 'input', area ? {} : { type: 'text' });
+            el.value = obj[key];
+            el.placeholder = placeholder;
+            if (area) el.rows = 3;
+            el.oninput = () => { obj[key] = el.value; check(); };
+        };
+        const select = (parent, label, obj, key, items) => {
+            const el = row(parent, label).createEl('select');
+            for (const [value, t] of items) el.createEl('option', { text: t, value });
+            el.value = obj[key];
+            el.onchange = () => { obj[key] = el.value; check(); };
+        };
+        text(contentEl, 'Id (optional, shown in front of the message)', form, 'id');
+        text(contentEl, 'Comment (what the rule is for, only for you)', form, 'comment', { area: true });
+        select(contentEl, 'Level', form, 'level', [['warn', 'warn: asks before the push'], ['error', 'error: blocks the push']]);
+        const en = row(contentEl, 'Enabled').createEl('input', { type: 'checkbox' });
+        en.checked = form.enabled;
+        en.onchange = () => { form.enabled = en.checked; };
+        text(contentEl, 'Where to look, comma separated', form, 'inText', { placeholder: 'note, filename, title, path, frontmatter, fm:<key>, section:<name>' });
+        select(contentEl, 'Violation when the text', form, 'mode', [['match', 'matches the pattern'], ['missing', 'does NOT match the pattern']]);
+        text(contentEl, 'Pattern (plain text is case-insensitive, /re/flags is exact)', form, 'pattern');
+        text(contentEl, 'Message ({match} is the text found)', form, 'message');
+        for (const [name, key] of [['Only when (all must hold)', 'when'], ['Not when', 'unless']]) {
+            const d = contentEl.createEl('details');
+            d.createEl('summary', { text: name });
+            const c = form[key];
+            d.open = Object.values(c).some(Boolean);
+            for (const k of COND_FIELDS) text(d, `${k} (regex)`, c, k);
+            text(d, 'Frontmatter, one "key = regex" per line', c, 'fm', { area: true });
+        }
+        const err = contentEl.createEl('div');
+        err.style.cssText = 'color:var(--text-error);margin:8px 0;min-height:1.2em;';
+        const bar = contentEl.createEl('div');
+        bar.style.cssText = 'display:flex;gap:8px;';
+        const save = bar.createEl('button', { text: 'Save', cls: 'mod-cta' });
+        bar.createEl('button', { text: 'Cancel' }).onclick = () => this.close();
+        const check = () => {
+            try { err.setText(ruleError(formToRule(form))); } catch (e) { err.setText(e.message); }
+            save.disabled = !!err.textContent;
+        };
+        save.onclick = () => { const rule = formToRule(form); this.close(); this.onSubmit(rule); };
+        check();
+    }
+    onClose() { this.contentEl.empty(); }
+}
+
 class PwnDocSettingTab extends PluginSettingTab {
     constructor(app, plugin) {
         super(app, plugin);
         this.plugin = plugin;
+    }
+
+    // The lint rules of the rules note, one row each: toggle, edit, duplicate, delete. The file stays the source of truth.
+    async renderRules(el) {
+        el.empty();
+        const { exists, list, error } = await this.plugin.readRules();
+        const again = () => this.renderRules(el);
+        if (!exists) {
+            new Setting(el).setName('Rules').setDesc('The rules note does not exist yet.')
+                .addButton(b => b.setButtonText('Create with examples').onClick(async () => { await this.plugin.createLintRulesFile(); again(); }));
+            return;
+        }
+        if (error) { el.createEl('p', { text: `${error}. Fix the note by hand: the editor does not touch a file it cannot read.` }).style.color = 'var(--text-error)'; return; }
+        const edit = change => async () => {
+            try { await this.plugin.editRules(change); } catch (e) { new Notice(`PwnDoc 2Sync: ${e.message}`); }
+            again();
+        };
+        const ask = (rule, onSubmit) => new RuleModal(this.app, rule, r => edit(l => onSubmit(l, r))()).open();
+        list.forEach((rule, i) => {
+            const err = ruleError(rule);
+            const s = new Setting(el)
+                .setName(rule?.id || `rule ${i + 1}`)
+                .setDesc([rule?.level ?? 'warn', `in ${[].concat(rule?.in ?? []).join(', ')}`, `${rule?.missing != null ? 'missing' : 'match'} ${rule?.missing ?? rule?.match ?? ''}`, rule?.comment, err && `ERROR: ${err}`].filter(Boolean).join(' · '));
+            if (err) s.nameEl.style.color = 'var(--text-error)';
+            s.addToggle(t => t.setValue(rule?.enabled !== false).onChange(v => edit(l => { const { enabled, ...rest } = l[i]; l[i] = v ? rest : { ...rest, enabled: false }; })()))
+                .addExtraButton(b => b.setIcon('pencil').setTooltip('Edit').onClick(() => ask(rule, (l, r) => { l[i] = r; })))
+                .addExtraButton(b => b.setIcon('copy').setTooltip('Duplicate').onClick(() => edit(l => l.splice(i + 1, 0, structuredClone(l[i])))()))
+                .addExtraButton(b => b.setIcon('trash').setTooltip('Delete').onClick(() => new ConfirmModal(this.app, `Delete the rule "${rule?.id || i + 1}" from the note?`, ok => { if (ok) edit(l => l.splice(i, 1))(); }).open()));
+        });
+        new Setting(el).addButton(b => b.setButtonText('Add rule').setCta()
+            .onClick(() => ask({ level: 'warn', in: 'note', match: '' }, (l, r) => { l.push(r); })));
     }
 
     display() {
@@ -2051,8 +2210,10 @@ class PwnDocSettingTab extends PluginSettingTab {
             .addText(t => t
                 .setPlaceholder('pwndoc-lint-rules.md')
                 .setValue(this.plugin.settings.lintRulesFile)
-                .onChange(async v => { this.plugin.settings.lintRulesFile = v.trim(); await this.plugin.saveSettings(); }))
-            .addButton(b => b.setButtonText('Create / open').onClick(() => this.plugin.createLintRulesFile()));
+                .onChange(async v => { this.plugin.settings.lintRulesFile = v.trim(); await this.plugin.saveSettings(); this.renderRules(rulesEl); }))
+            .addButton(b => b.setButtonText('Create / open').onClick(async () => { await this.plugin.createLintRulesFile(); this.renderRules(rulesEl); }));
+        const rulesEl = containerEl.createEl('div');
+        this.renderRules(rulesEl);
 
         new Setting(containerEl)
             .setName('Mandatory General Information fields')
@@ -3811,6 +3972,25 @@ class PwnDocImporterPlugin extends Plugin {
         return [...issues, ...errors.map(message => ({ level: 'warn', section: 'rule', where: 'rules file', message }))];
     }
 
+    // The rules note for the editor: { exists, md, path, list } or { exists, error }
+    async readRules() {
+        const path = normalizePath((this.settings.lintRulesFile || 'pwndoc-lint-rules.md').trim());
+        const adapter = this.app.vault.adapter;
+        if (!(await adapter.exists(path))) return { exists: false, list: [] };
+        const md = await adapter.read(path);
+        return { exists: true, md, path, ...rulesList(extractRulesText(md), parseYaml) };
+    }
+
+    // Let `change` edit the rules list, then write it back: only the yaml block of the note changes
+    async editRules(change) {
+        const r = await this.readRules();
+        if (!r.exists || r.error) throw new Error(r.error || 'the rules note does not exist');
+        change(r.list);
+        const md = writeRulesText(r.md, r.list, stringifyYaml);
+        const f = this.app.vault.getAbstractFileByPath(r.path);
+        if (f) await this.app.vault.modify(f, md); else await this.app.vault.adapter.write(r.path, md);
+    }
+
     async createLintRulesFile() {
         const path = normalizePath((this.settings.lintRulesFile || 'pwndoc-lint-rules.md').trim());
         const adapter = this.app.vault.adapter;
@@ -4131,7 +4311,7 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { compareCustomFields, extractRulesText, parseLintRules, runCustomLint, createAudit, nameTaken, deleteFinding, sortDashboardRows, dashboardCounts, filterDashboardRows, bulkSummary, missingGeneralFields, reportFailureLines, GENERAL_FIELDS, DEFAULT_GENERAL_REQUIRED, setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
+module.exports.__test = { rulesList, ruleError, writeRulesText, formToRule, ruleToForm, compareCustomFields, extractRulesText, parseLintRules, runCustomLint, createAudit, nameTaken, deleteFinding, sortDashboardRows, dashboardCounts, filterDashboardRows, bulkSummary, missingGeneralFields, reportFailureLines, GENERAL_FIELDS, DEFAULT_GENERAL_REQUIRED, setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
     sideBySide, missingFindings, findingToNoteRow, IMPORT_SECTIONS, folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,

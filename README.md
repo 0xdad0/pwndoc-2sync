@@ -105,7 +105,9 @@ Besides the built-in checks you can write your own rules in a vault note (*Open 
 | `missing` | A violation if the text does **not** match (a required text). Give exactly one of `match` and `missing` |
 | `message` | What to tell. `{match}` is the text found; for note and section targets the line number is added |
 | `when` / `unless` | Apply the rule only when (or not when) the conditions hold. Keys: `folder`, `file`, `path`, `title`, `engagement` (regex each) and `fm` (a map from frontmatter key to regex). Every key of the block must hold |
-| `id`, `enabled` | Optional label shown in the message; `enabled: false` switches a rule off |
+| `id`, `enabled`, `comment` | Optional label shown in the message; `enabled: false` switches a rule off; `comment` is a note for you, the lint ignores it |
+
+You can also edit the rules without touching the yaml: *Settings > PwnDoc 2Sync > Custom lint rules note* lists them, with a switch to enable or disable each one, edit (form with a live check of the rule, including the comment), duplicate, delete and *Add rule*. The editor writes back only the yaml block of the note, so the text around it is kept; the `#` comments you typed by hand inside the block are lost on the first save from the editor (use the `comment` field instead).
 
 A pattern is a regular expression: plain text is case-insensitive, `/re/flags` is exact. A rule with a mistake (bad regex, unknown key or target) is reported as a lint warning and skipped; the other rules still run. If the note does not exist there are no custom rules.
 
