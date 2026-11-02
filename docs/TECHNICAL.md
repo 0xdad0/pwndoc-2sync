@@ -46,7 +46,7 @@ The audit of a note is resolved by `resolveAuditId`: `pwndoc_audit_id`, else the
 
 ### 2.2 Settings (`data.json`)
 
-`folderAudits` (`{ [folder]: { auditId, name } }`, renamed with the folder), `imageCache`, `historyLimit`, `attachmentsFolder`, `reportsFolder`, `watchRemote`, `watchIntervalMin`, `generalRequired`, `lastAuditType`, `lastLanguage`, `apiUrl`, `apiUsername`, `apiPasswordSecret` (the secret id; the password itself is in Obsidian secret storage, a legacy plain `apiPassword` is migrated on load), `apiIgnoreSsl`, plus the import settings (`csvPath`, `locale`, `quickImport*`, `owaspFieldId`, `cweFieldId`, `csvOutputFolder`, `templates`, `debugMode`). `data.json` holds the PwnDoc address and engagement names: do not share it.
+`folderAudits` (`{ [folder]: { auditId, name } }`, renamed with the folder), `imageCache`, `historyLimit`, `attachmentsFolder`, `reportsFolder`, `watchRemote`, `watchIntervalMin`, `generalRequired`, `lastAuditType`, `lastLanguage`, `apiUrl`, `apiUsername`, `lintRulesFile`, `apiPasswordSecret` (the secret id; the password itself is in Obsidian secret storage, a legacy plain `apiPassword` is migrated on load), `apiIgnoreSsl`, plus the import settings (`csvPath`, `locale`, `quickImport*`, `csvOutputFolder`, `templates`, `debugMode`). `data.json` holds the PwnDoc address and engagement names: do not share it.
 
 ### 2.3 History store
 
@@ -80,7 +80,7 @@ The audit of a note is resolved by `resolveAuditId`: `pwndoc_audit_id`, else the
 
 **Codecs** (`cmpLocal`, `cmpRemote`, `toRemote`, `toFm`) map a frontmatter value and a finding value to one comparison string. Rules: an empty frontmatter value is never pushed (`toRemote` is skipped, otherwise a missing `status` would reopen a finding); an unrepresentable value (`priority: banana`, `1.5`) throws `invalid <label>`; `toFm` decides what a pull writes back (`status` writes `COMPLETED`, writes `DRAFT` only if the note said completed, leaves other workflow values alone).
 
-**Custom fields** (`customFieldsPatch`): the note text is parsed into `**label**` blocks; the PUT array is the finding's own entries with the text replaced **only for the labels whose text differs from the rendered PwnDoc value** (so untouched fields keep their exact stored value). Rich `text` fields go through the Markdown to HTML path; `input`, `date`, `radio`, `select` stay plain; other types or array values are refused. Unknown labels are looked up in `cfLabels`, else rejected.
+**Custom fields** are shown field by field: `compareCustomFields` pairs the `**label**` blocks of the note with the finding's fields (labels compared ignoring case, spacing and a trailing colon) and reports `same`, `changed`, `note only` or `PwnDoc only`; the compare dialog lists them above the diff. A PwnDoc field whose label cannot be resolved is shown as `cf_<id>`, never dropped. The importer writes every non-empty custom field, OWASP and CWE included (they used to be left out of the note, so the compare saw them only on the PwnDoc side). `customFieldsPatch`: the note text is parsed into `**label**` blocks; the PUT array is the finding's own entries with the text replaced **only for the labels whose text differs from the rendered PwnDoc value** (so untouched fields keep their exact stored value). Rich `text` fields go through the Markdown to HTML path; `input`, `date`, `radio`, `select` stay plain; other types or array values are refused. Unknown labels are looked up in `cfLabels`, else rejected.
 
 ## 4. Sync model
 
@@ -133,6 +133,12 @@ Runs on the sections about to be pushed (compare dialog and bulk push) and on de
 | warn | empty section, image not followed by a caption line, caption number not progressive across the whole note (document order), caption word not matching the audit language (`IT` is `Figura`, `EN` is `Figure`), caption separator not an en dash |
 
 Not linted: sections resolved with *Merge both* (their text carries PwnDoc image ids, not vault paths).
+
+### 7.1 Custom rules
+
+`loadLintRules` reads the rules note (setting `lintRulesFile`), `extractRulesText` takes its first ```` ```yaml ```` block (or the whole text), `parseLintRules(text, parseYaml)` (Obsidian's `parseYaml`) validates and compiles it. A rule that fails to compile is reported (`rule N (id): reason`) and skipped; the report becomes a `warn` issue so a typo is never silent. `lintIssues` merges built-in issues, custom issues and rule-file errors; `lintGate`, `lintCurrentNote` and `bulkSync` all go through it.
+
+Evaluation (`runCustomLint(rules, ctx)`), `ctx = { path, folder, basename, title, fm, md, engagement }`: skip the rule if `when` does not hold or `unless` holds (each is a map of conditions that must all hold: `folder`, `file`, `path`, `title`, `engagement`, `fm.<key>`, each a regex tested on the value, frontmatter arrays joined with `, `); then for every target in `in` take its text (`note` without frontmatter, `filename`, `title`, `path`, `frontmatter` as `key: value` lines, `fm:<key>`, `section:<name>` via the section aliases, an absent section is `''`) and test the regex: `match` is a violation when it matches (first match, line number for multi-line targets), `missing` when it does not. Regexes: `/re/flags` literal (the `g` and `y` flags are dropped, they make `test` stateful), otherwise the text compiled case-insensitive. Issues are `{ level, section: 'rule', where, message }` with an optional `[id]` prefix. The rules run on the whole note regardless of which sections are being pushed.
 
 ## 8. Engagement dashboard
 

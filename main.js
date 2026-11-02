@@ -1,6 +1,6 @@
 'use strict';
 
-const { Plugin, PluginSettingTab, Setting, FuzzySuggestModal, SuggestModal, Modal, Notice, normalizePath, SecretComponent, Component, MarkdownRenderer, htmlToMarkdown, Menu, MarkdownView } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, FuzzySuggestModal, SuggestModal, Modal, Notice, normalizePath, SecretComponent, Component, MarkdownRenderer, htmlToMarkdown, Menu, MarkdownView, parseYaml } = require('obsidian');
 
 // ── CSV Parser ────────────────────────────────────────────────────────────────
 function parseCSV(text) {
@@ -389,12 +389,32 @@ function lineDiff(a, b) {
 }
 
 // Custom fields rendered the way createVulnNote writes them: **label** + value, empty ones omitted
+// The non-empty custom fields of a finding as { id, label, md }. A field whose label cannot be resolved is shown as cf_<id>, never dropped.
+function customEntries(finding, ctx) {
+    return (finding.customFields || []).map(cf => {
+        const id = cf.customField?._id ?? cf.customField;
+        const text = Array.isArray(cf.text) ? cf.text.join('; ') : cf.text || '';
+        return { id, label: ctx.cfLabels?.[id] || cf.customField?.label || `cf_${id}`, md: ctx.htmlToMd(text) };
+    }).filter(e => e.md);
+}
+
 function renderCustomFields(finding, ctx) {
-    return (finding.customFields || [])
-        .map(cf => ({ label: ctx.cfLabels?.[cf.customField?._id || cf.customField] || cf.customField?.label || '', value: ctx.htmlToMd(cf.text || '') }))
-        .filter(c => c.label && c.value)
-        .flatMap(c => [`**${c.label}**`, '', c.value, ''])
-        .join('\n').trim();
+    return customEntries(finding, ctx).flatMap(c => [`**${c.label}**`, '', c.md, '']).join('\n').trim();
+}
+
+const normLabel = s => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
+
+// Field by field: same, changed, only in the note, only on PwnDoc. Labels match ignoring case, spacing and a trailing colon.
+function compareCustomFields(noteText, finding, ctx) {
+    const remote = customEntries(finding, ctx);
+    const used = new Set();
+    const out = parseCustomFieldsText(noteText).filter(c => c.md).map(l => {
+        const r = remote.find(x => normLabel(x.label) === normLabel(l.label));
+        if (r) used.add(r);
+        return { label: l.label, status: !r ? 'note only' : r.md === l.md ? 'same' : 'changed', local: l.md, remote: r?.md ?? '' };
+    });
+    for (const r of remote) if (!used.has(r)) out.push({ label: r.label, status: 'PwnDoc only', local: '', remote: r.md });
+    return out;
 }
 
 const listLines = text => text.split(/\n|; /).map(l => l.replace(/^\s*[-*]\s+/, '').trim()).filter(Boolean).join('\n');
@@ -427,7 +447,8 @@ async function buildComparison(ctx, noteMd, finding, keys, noteInfo = {}, base =
         const baseText = base?.sections?.[key];
         const status = classify(baseText, local, remote);
         const merge = status === 'conflict' && !def.source ? merge3(baseText, local, remote) : null;
-        rows.push({ key, local, remote, base: baseText, status, merge, changed: local !== remote, localEmpty: def.cmpLocal ? String(localRaw ?? '').trim() === '' : local === '', remoteEmpty: remote === '', diff: lineDiff(remote, local) });
+        const fields = def.kind === 'custom' ? compareCustomFields(localRaw, finding, ctx) : undefined;
+        rows.push({ key, local, remote, fields, base: baseText, status, merge, changed: local !== remote, localEmpty: def.cmpLocal ? String(localRaw ?? '').trim() === '' : local === '', remoteEmpty: remote === '', diff: lineDiff(remote, local) });
     }
     return rows;
 }
@@ -681,7 +702,7 @@ function parseCustomFieldsText(text) {
     const out = [];
     for (const line of String(text || '').split('\n')) {
         const m = line.match(/^\*\*(.+)\*\*\s*$/);
-        if (m) out.push({ label: m[1].trim(), lines: [] });
+        if (m) out.push({ label: m[1].trim().replace(/\s*:$/, ''), lines: [] });
         else if (out.length) out.at(-1).lines.push(line);
     }
     return out.map(c => ({ label: c.label, md: c.lines.join('\n').trim() }));
@@ -697,13 +718,13 @@ const PLAIN_CF_TYPES = ['input', 'date', 'radio', 'select'];
 async function customFieldsPatch(ctx, auditId, fresh, text) {
     const entries = (fresh.customFields || []).map(cf => {
         const id = cf.customField?._id ?? cf.customField;
-        return { id, label: ctx.cfLabels?.[id] || cf.customField?.label || '', type: cf.customField?.fieldType || ctx.cfTypes?.[id], text: cf.text };
+        return { id, label: ctx.cfLabels?.[id] || cf.customField?.label || `cf_${id}`, type: cf.customField?.fieldType || ctx.cfTypes?.[id], text: cf.text };
     });
     for (const { label, md } of parseCustomFieldsText(text)) {
         if (!md) continue;
-        let e = entries.find(x => x.label === label);
+        let e = entries.find(x => normLabel(x.label) === normLabel(label));
         if (!e) {
-            const id = Object.keys(ctx.cfLabels || {}).find(k => ctx.cfLabels[k] === label);
+            const id = Object.keys(ctx.cfLabels || {}).find(k => normLabel(ctx.cfLabels[k]) === normLabel(label));
             if (!id) throw new Error(`unknown custom field "${label}"`);
             entries.push(e = { id, label, type: ctx.cfTypes?.[id], text: '' });
         }
@@ -1025,7 +1046,7 @@ const fenceOpen = text => {
 
 // Problems that make a push wrong ('error', the push is blocked) or sloppy ('warn', the user may go on).
 // opts: { sections: keys about to be pushed, fm, basename, locale, exists(src) -> bool }
-function lintNote(md, { sections, fm = {}, basename = '', locale = '', exists = () => true }) {
+function lintNote(md, { sections, fm = {}, basename = '', locale = '', exists = () => true, rules = [], path = '', engagement = '' }) {
     const issues = [];
     const add = (level, section, message) => issues.push({ level, section, message });
     const secs = parseSections(md);
@@ -1065,8 +1086,184 @@ function lintNote(md, { sections, fm = {}, basename = '', locale = '', exists = 
             }
         });
     }
+    if (rules.length) issues.push(...runCustomLint(rules, { path, folder: parentDir(path), basename, title: titleFromBasename(basename), fm, md, engagement }));
     return issues;
 }
+
+// ── Custom lint rules ─────────────────────────────────────────────────────────
+// Rules live in a note of the vault (a yaml block). One rule is a map with:
+//   level    error (blocks the push) or warn (asks), default warn
+//   in       where to look: note, filename, title, path, frontmatter, fm:<key>, section:<name>; one or a list
+//   match    regex: a violation if the text matches            } exactly one
+//   missing  regex: a violation if the text does NOT match     }
+//   message  what to tell; {match} is the text found
+//   when / unless   conditions: folder, file, path, title, engagement (regex each), fm: { key: regex }
+//   id, enabled     optional
+// A regex is plain text (case-insensitive) or /re/flags (exact).
+const RULE_KEYS = new Set(['id', 'level', 'in', 'match', 'missing', 'message', 'when', 'unless', 'enabled']);
+const COND_KEYS = new Set(['folder', 'file', 'path', 'title', 'engagement', 'fm']);
+const SIMPLE_TARGETS = new Set(['note', 'filename', 'title', 'path', 'frontmatter']);
+
+function toRegex(src) {
+    const m = /^\/(.+)\/([a-z]*)$/s.exec(String(src));
+    return m ? new RegExp(m[1], m[2].replace(/[gy]/g, '')) : new RegExp(String(src), 'i');
+}
+
+function compileCondition(cond) {
+    if (typeof cond !== 'object' || cond === null || Array.isArray(cond)) throw new Error('a condition must be a map');
+    const out = {};
+    for (const [k, v] of Object.entries(cond)) {
+        if (!COND_KEYS.has(k)) throw new Error(`unknown condition "${k}"`);
+        out[k] = k === 'fm' ? Object.fromEntries(Object.entries(v || {}).map(([fk, fv]) => [fk, toRegex(fv)])) : toRegex(v);
+    }
+    return out;
+}
+
+function compileTarget(t) {
+    const label = String(t).trim();
+    if (SIMPLE_TARGETS.has(label)) return { kind: label, label };
+    const m = label.match(/^(fm|section):(.+)$/);
+    if (!m) throw new Error(`unknown target "${label}"`);
+    const name = m[2].trim();
+    if (m[1] === 'fm') return { kind: 'fm', key: name, label };
+    const key = ALIAS_TO_KEY.get(name.toLowerCase()) ?? SECTION_DEFS.find(d => !d.source && d.key.toLowerCase() === name.toLowerCase())?.key;
+    if (!key) throw new Error(`unknown section "${name}"`);
+    return { kind: 'section', key, label };
+}
+
+// The yaml block of the rules note (the first one), or the whole text when there is no fence
+function extractRulesText(md) {
+    const m = md.match(/```ya?ml[^\n]*\n([\s\S]*?)\n```/);
+    return m ? m[1] : md;
+}
+
+// -> { rules: compiled, errors: ["rule 3 (id): message"] }; a broken rule is reported and skipped, the others still run
+function parseLintRules(text, parseYaml) {
+    const rules = [], errors = [];
+    let doc;
+    try { doc = parseYaml(text); } catch (e) { return { rules, errors: [`rules file: ${e.message}`] }; }
+    const list = Array.isArray(doc) ? doc : doc?.rules;
+    if (!Array.isArray(list)) return { rules, errors: doc == null ? [] : ['rules file: expected a list of rules, or "rules:" with a list'] };
+    list.forEach((r, i) => {
+        try {
+            if (typeof r !== 'object' || r === null) throw new Error('a rule must be a map');
+            if (r.enabled === false) return;
+            for (const k of Object.keys(r)) if (!RULE_KEYS.has(k)) throw new Error(`unknown key "${k}"`);
+            const level = r.level ?? 'warn';
+            if (level !== 'error' && level !== 'warn') throw new Error(`level must be error or warn, not "${level}"`);
+            if (r.in == null) throw new Error('"in" is required');
+            if ((r.match == null) === (r.missing == null)) throw new Error('give exactly one of "match" and "missing"');
+            const targets = [].concat(r.in).map(compileTarget);
+            let re;
+            try { re = toRegex(r.match ?? r.missing); } catch (e) { throw new Error(`invalid regex: ${e.message}`); }
+            rules.push({
+                id: r.id ? String(r.id) : '', level, targets, re, mode: r.match != null ? 'match' : 'missing',
+                message: r.message ? String(r.message) : null,
+                when: r.when ? compileCondition(r.when) : null, unless: r.unless ? compileCondition(r.unless) : null,
+            });
+        } catch (e) { errors.push(`rule ${i + 1}${r?.id ? ` (${r.id})` : ''}: ${e.message}`); }
+    });
+    return { rules, errors };
+}
+
+const fmString = v => (v == null ? '' : Array.isArray(v) ? v.join(', ') : typeof v === 'object' ? JSON.stringify(v) : String(v));
+const stripFrontmatter = md => md.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
+
+function conditionHolds(cond, ctx) {
+    const values = { folder: ctx.folder, file: ctx.basename, path: ctx.path, title: ctx.title, engagement: ctx.engagement };
+    return Object.entries(cond).every(([k, re]) => (k === 'fm'
+        ? Object.entries(re).every(([fk, fre]) => fre.test(fmString(ctx.fm?.[fk])))
+        : re.test(String(values[k] ?? ''))));
+}
+
+function targetText(t, ctx) {
+    switch (t.kind) {
+        case 'note': return ctx.body ?? stripFrontmatter(ctx.md);
+        case 'filename': return ctx.basename;
+        case 'title': return ctx.title;
+        case 'path': return ctx.path;
+        case 'frontmatter': return Object.entries(ctx.fm || {}).map(([k, v]) => `${k}: ${fmString(v)}`).join('\n');
+        case 'fm': return fmString(ctx.fm?.[t.key]);
+        default: return parseSections(ctx.md)[t.key]?.text ?? '';
+    }
+}
+
+// ctx: { path, folder, basename, title, fm, md, engagement } -> issues like the built-in ones (section: 'rule')
+function runCustomLint(rules, ctx) {
+    const issues = [];
+    for (const rule of rules) {
+        if (rule.when && !conditionHolds(rule.when, ctx)) continue;
+        if (rule.unless && conditionHolds(rule.unless, ctx)) continue;
+        for (const t of rule.targets) {
+            const text = targetText(t, ctx);
+            let message;
+            if (rule.mode === 'match') {
+                const m = rule.re.exec(text);
+                if (!m) continue;
+                const line = ['note', 'frontmatter', 'section'].includes(t.kind) ? ` (line ${text.slice(0, m.index).split('\n').length})` : '';
+                message = (rule.message ?? 'forbidden text: {match}').replace(/\{match\}/g, m[0].slice(0, 60)) + line;
+            } else {
+                if (rule.re.test(text)) continue;
+                message = rule.message ?? `required text not found: ${rule.re.source}`;
+            }
+            issues.push({ level: rule.level, section: 'rule', where: t.label, message: (rule.id ? `[${rule.id}] ` : '') + message });
+        }
+    }
+    return issues;
+}
+
+const LINT_RULES_TEMPLATE = `# PwnDoc 2Sync lint rules
+
+These rules are checked together with the built-in ones: before every push, in "Lint this note" and in the dashboard bulk push.
+Edit the yaml block below. The examples are switched off (\`enabled: false\`): turn on and adapt the ones you need.
+
+- \`level\`: \`error\` blocks the push, \`warn\` asks for confirmation (default).
+- \`in\`: where to look. One or a list of: \`note\` (text without frontmatter), \`filename\`, \`title\` (file name without \`VT-NN - \`), \`path\`, \`frontmatter\`, \`fm:<key>\`, \`section:<name>\` (evidenza, description, remediation...).
+- \`match\`: a violation if the text matches. \`missing\`: a violation if the text does NOT match. Give one of the two.
+- A pattern is a regex: plain text is case-insensitive, \`/re/flags\` is exact.
+- \`message\`: what to say; \`{match}\` is the text found.
+- \`when\` / \`unless\`: apply the rule only when (or not when) the conditions hold. Keys: \`folder\`, \`file\`, \`path\`, \`title\`, \`engagement\` (regex each) and \`fm\` (a map of frontmatter key to regex). All the keys of a block must hold.
+
+\`\`\`yaml
+- id: no-credentials
+  enabled: false
+  level: error
+  in: note
+  match: '(password|passwd|pwd|secret)\\s*[:=]\\s*\\S+'
+  message: 'Possible credential in the note: {match}'
+
+- id: generali-no-test-in-name
+  enabled: false
+  level: error
+  in: filename
+  match: test
+  message: 'No "Test" in the file name for this client'
+  when:
+    folder: Generali
+
+- id: asset-placeholder
+  enabled: false
+  in: fm:assets
+  match: INSERT_ASSET
+  message: 'Fill in the assets'
+
+- id: file-name-pattern
+  enabled: false
+  level: error
+  in: filename
+  missing: '^(VT|M)-\\d{2} - '
+  message: 'The file name must start with VT-NN - or M-NN - '
+
+- id: evidence-needs-request
+  enabled: false
+  in: section:evidenza
+  missing: '(GET|POST|PUT|DELETE) /'
+  message: 'The evidence should show the request'
+  unless:
+    fm:
+      platform: 'Android|iOS'
+\`\`\`
+`;
 
 // ── Dashboard, remote changes, orphans ────────────────────────────────────────
 const STATE_RANK = { same: 0, unknown: 1, remote: 2, local: 3, conflict: 4 };
@@ -1383,8 +1580,6 @@ const DEFAULT_SETTINGS = {
     locale:          'EN-en',
     quickImportSource: 'csv', // 'csv' | 'api'
     quickImportLocale: '',    // '' = all locales
-    owaspFieldId:    'cf_62d92f1597c7c5001833273f',
-    cweFieldId:      'cf_63ab317fafe66f0011b89881',
     apiUrl:          '',
     apiUsername:     '',
     apiPasswordSecret: SECRET_ID,
@@ -1401,6 +1596,7 @@ const DEFAULT_SETTINGS = {
     reportsFolder:   'reports', // where generated reports are saved (vault path)
     lastAuditType:   '',    // remembered for the next new engagement
     lastLanguage:    '',
+    lintRulesFile:   'pwndoc-lint-rules.md', // note with the custom lint rules (yaml block)
     generalRequired: DEFAULT_GENERAL_REQUIRED.join(','), // General Information fields checked when an export fails
 };
 
@@ -1740,24 +1936,6 @@ class PwnDocSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.quickImportLocale)
                 .onChange(async v => { this.plugin.settings.quickImportLocale = v; await this.plugin.saveSettings(); }));
 
-        containerEl.createEl('h3', { text: 'Custom field IDs' });
-        containerEl.createEl('p', {
-            text: 'cf_<objectId> column names in the CSV for OWASP and CWE values.',
-            cls: 'setting-item-description',
-        });
-
-        new Setting(containerEl)
-            .setName('OWASP field column')
-            .addText(t => t
-                .setValue(this.plugin.settings.owaspFieldId)
-                .onChange(async v => { this.plugin.settings.owaspFieldId = v.trim(); await this.plugin.saveSettings(); }));
-
-        new Setting(containerEl)
-            .setName('CWE field column')
-            .addText(t => t
-                .setValue(this.plugin.settings.cweFieldId)
-                .onChange(async v => { this.plugin.settings.cweFieldId = v.trim(); await this.plugin.saveSettings(); }));
-
         containerEl.createEl('h3', { text: 'API credentials' });
         containerEl.createEl('p', {
             text: 'Credentials are stored in plain text in the plugin data file. Leave blank to be prompted each time.',
@@ -1836,6 +2014,15 @@ class PwnDocSettingTab extends PluginSettingTab {
                     const n = parseInt(v, 10);
                     if (n >= 0) { this.plugin.settings.watchIntervalMin = n; await this.plugin.saveSettings(); }
                 }));
+
+        new Setting(containerEl)
+            .setName('Custom lint rules note')
+            .setDesc('Vault note with the rules in a yaml block, checked with the built-in lint. Not an error if it does not exist.')
+            .addText(t => t
+                .setPlaceholder('pwndoc-lint-rules.md')
+                .setValue(this.plugin.settings.lintRulesFile)
+                .onChange(async v => { this.plugin.settings.lintRulesFile = v.trim(); await this.plugin.saveSettings(); }))
+            .addButton(b => b.setButtonText('Create / open').onClick(() => this.plugin.createLintRulesFile()));
 
         new Setting(containerEl)
             .setName('Mandatory General Information fields')
@@ -2094,6 +2281,15 @@ class MergeModal extends Modal {
                 btns[k] = b;
             }
 
+            if (row.fields?.length) {
+                const FC = { same: 'var(--text-success)', changed: 'var(--text-warning)', 'note only': 'var(--text-accent)', 'PwnDoc only': 'var(--text-error)' };
+                const fl = box.createEl('div');
+                fl.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-top:6px;';
+                for (const f of row.fields) {
+                    const c = fl.createEl('span', { text: `${f.label}: ${f.status}` });
+                    c.style.cssText = `color:${FC[f.status]};border:1px solid ${FC[f.status]};border-radius:10px;padding:0 8px;font-size:0.78em;`;
+                }
+            }
             if (row.changed) {
                 const grid = box.createEl('div');
                 grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:0 8px;margin-top:6px;max-height:280px;overflow:auto;font-family:var(--font-monospace);font-size:0.8em;';
@@ -2299,7 +2495,7 @@ class LintModal extends Modal {
         for (const i of this.issues) {
             const line = contentEl.createEl('div');
             line.style.cssText = `margin:2px 0;color:${i.level === 'error' ? 'var(--text-error)' : 'var(--text-warning)'};`;
-            line.setText(`${i.level === 'error' ? '✗' : '!'} [${labelOf(defOf(i.section))}] ${i.message}`);
+            line.setText(`${i.level === 'error' ? '✗' : '!'} [${i.section === 'rule' ? `rule: ${i.where}` : labelOf(defOf(i.section))}] ${i.message}`);
         }
         const answer = v => { this.answered = true; this.close(); this.onAnswer?.(v); };
         const bar = contentEl.createEl('div');
@@ -2707,6 +2903,7 @@ class PwnDocImporterPlugin extends Plugin {
         cmd('send-to-pwndoc', 'Send note to PwnDoc (select or create the finding, then push)', () => this.sendToPwndoc());
         cmd('engagement-dashboard', 'Engagement dashboard (sync status of every note)', () => this.openDashboard());
         cmd('lint-note', 'Lint this note before pushing', () => this.lintCurrentNote());
+        cmd('lint-rules-file', 'Open (or create) the custom lint rules note', () => this.createLintRulesFile());
         cmd('delete-finding', 'Delete this note\'s finding from PwnDoc', () => this.deleteNoteFindingCommand());
         cmd('create-engagement', 'Create a new engagement on PwnDoc', () => this.createEngagement());
         cmd('unlink-note', 'Unlink note from its PwnDoc finding', () => this.unlinkNote());
@@ -3080,6 +3277,7 @@ class PwnDocImporterPlugin extends Plugin {
         item('Mark finding as completed', 'check-circle', () => this.setCompleted(true));
         item('Reopen finding', 'rotate-ccw', () => this.setCompleted(false));
         item('Lint this note', 'list-checks', () => this.lintCurrentNote());
+        item('Custom lint rules', 'list-filter', () => this.createLintRulesFile());
         item('Unlink from finding', 'unlink', () => this.unlinkNote());
         item('Delete finding from PwnDoc', 'trash-2', () => this.deleteNoteFindingCommand());
         menu.addSeparator();
@@ -3426,8 +3624,7 @@ class PwnDocImporterPlugin extends Plugin {
                 const ctx = this.syncCtx(file, row.findingId, audit._id);
                 const noteMd = await this.app.vault.read(file);
                 if (direction === 'push') {
-                    const err = lintNote(noteMd, { sections: plan.run, fm: ctx.noteInfo.fm, basename: file.basename, locale: audit.language, exists: s => !!ctx.resolvePath(s) })
-                        .find(i => i.level === 'error');
+                    const err = (await this.lintIssues(file, noteMd, plan.run, audit.language, ctx)).find(i => i.level === 'error');
                     if (err) throw new Error(`lint: ${err.message}`);
                     await pushSections(ctx, { auditId: audit._id, findingId: row.findingId, noteMd, sections: plan.run, snapshotFinding: audit.findings.find(f => f._id === row.findingId), force });
                 } else {
@@ -3522,9 +3719,36 @@ class PwnDocImporterPlugin extends Plugin {
 
     // ── Lint, remote changes, completion status, report, figures ─────────────────
 
+    // The custom rules of the rules note (none when the file does not exist); broken rules come back as errors
+    async loadLintRules() {
+        const path = (this.settings.lintRulesFile || '').trim();
+        const adapter = this.app.vault.adapter;
+        if (!path || !(await adapter.exists(normalizePath(path)))) return { rules: [], errors: [] };
+        return parseLintRules(extractRulesText(await adapter.read(normalizePath(path))), parseYaml);
+    }
+
+    // Built-in and custom lint of one note
+    async lintIssues(file, md, keys, locale, ctx) {
+        const { rules, errors } = await this.loadLintRules();
+        const fm = ctx.noteInfo.fm;
+        const issues = lintNote(md, {
+            sections: keys, fm, basename: file.basename, locale, exists: s => !!ctx.resolvePath(s), rules, path: file.path,
+            engagement: fm.pwndoc_audit || folderAuditFor(file.path, this.settings.folderAudits)?.name || '',
+        });
+        return [...issues, ...errors.map(message => ({ level: 'warn', section: 'rule', where: 'rules file', message }))];
+    }
+
+    async createLintRulesFile() {
+        const path = normalizePath((this.settings.lintRulesFile || 'pwndoc-lint-rules.md').trim());
+        const adapter = this.app.vault.adapter;
+        if (!(await adapter.exists(path))) { await adapter.write(path, LINT_RULES_TEMPLATE); new Notice(`PwnDoc 2Sync: created ${path} with example rules (all switched off).`); }
+        const f = this.app.vault.getAbstractFileByPath(path);
+        if (f) await this.app.workspace.getLeaf().openFile(f);
+    }
+
     // false when the push must not go on: errors block, warnings ask
     async lintGate(file, md, keys, locale, ctx) {
-        const issues = lintNote(md, { sections: keys, fm: ctx.noteInfo.fm, basename: file.basename, locale, exists: s => !!ctx.resolvePath(s) });
+        const issues = await this.lintIssues(file, md, keys, locale, ctx);
         if (!issues.length) return true;
         return new Promise(resolve => new LintModal(this.app, issues, resolve).open());
     }
@@ -3536,8 +3760,7 @@ class PwnDocImporterPlugin extends Plugin {
         const ctx = this.syncCtx(file, '', '');
         const body = Object.keys(parseSections(md)).filter(k => !defOf(k).source && k !== 'customFields');
         const locale = ctx.noteInfo.fm.locale || '';
-        new LintModal(this.app, lintNote(md, { sections: [...body, 'title', 'cvssv3', 'vulnType', 'priority', 'remediationComplexity'],
-            fm: ctx.noteInfo.fm, basename: file.basename, locale, exists: s => !!ctx.resolvePath(s) }), null).open();
+        new LintModal(this.app, await this.lintIssues(file, md, [...body, 'title', 'cvssv3', 'vulnType', 'priority', 'remediationComplexity'], locale, ctx), null).open();
     }
 
     hasCredentials() {
@@ -3727,18 +3950,9 @@ class PwnDocImporterPlugin extends Plugin {
             ? (platformMap[vuln.category] || 'Android')
             : (platformMap[vuln.category] || 'WEB');
 
-        // OWASP + CWE — resolve setting id (may be cf_<id> or label) to actual row key
-        const cfLabels = this.cfLabels || {};
-        const resolveKey = s => (s.startsWith('cf_') && cfLabels[s.slice(3)]) ? cfLabels[s.slice(3)] : s;
-        const owaspKey = resolveKey(this.settings.owaspFieldId);
-        const cweKey   = resolveKey(this.settings.cweFieldId);
-        const owasp = vuln[owaspKey] || '';
-        const cwe   = vuln[cweKey]   || '';
-
-        // Extra custom fields (non-standard, non-owasp/cwe, non-empty)
-        const reservedKeys = new Set([owaspKey, cweKey, this.settings.owaspFieldId, this.settings.cweFieldId]);
+        // Every non-empty custom field (OWASP and CWE included), so the compare with PwnDoc sees them all
         const extraCf = Object.keys(vuln)
-            .filter(k => !STANDARD_FIELDS.has(k) && !reservedKeys.has(k))
+            .filter(k => !STANDARD_FIELDS.has(k))
             .map(k => ({
                 label: k,
                 value: htmlToMd(vuln[k] || ''),
@@ -3844,7 +4058,7 @@ class PwnDocImporterPlugin extends Plugin {
 }
 
 module.exports = PwnDocImporterPlugin;
-module.exports.__test = { createAudit, nameTaken, deleteFinding, sortDashboardRows, dashboardCounts, filterDashboardRows, bulkSummary, missingGeneralFields, reportFailureLines, GENERAL_FIELDS, DEFAULT_GENERAL_REQUIRED, setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
+module.exports.__test = { compareCustomFields, extractRulesText, parseLintRules, runCustomLint, createAudit, nameTaken, deleteFinding, sortDashboardRows, dashboardCounts, filterDashboardRows, bulkSummary, missingGeneralFields, reportFailureLines, GENERAL_FIELDS, DEFAULT_GENERAL_REQUIRED, setAuditTemplate, templateLabel, findingChoices, bulkPlan, lintNote, nextFigureNumber, figureCaption, orphanReason, watchedRows, remoteChanges, overallState, buildDashboard, generateReport, reportFileName, pastedImageName, STATUS_DONE, STATUS_OPEN, parseCustomFieldsText, customFieldsPatch, setFindingStatus, metaToFrontmatter, pwndocApi, migratePassword, SECRET_ID, SECTION_DEFS, DEFAULT_SYNC_SECTIONS, parseSections, replaceSection, serializeWhitelist, imgToken, expandImgTokens, resolveAuditId, renameFolderKeys, titleFromBasename, rankFindings,
     extractImageRefs, replaceImageRefs, uploadImage, tokenizeImages, downloadImage, pullImages,
     lineDiff, buildComparison, renderCustomFields,
     sideBySide, missingFindings, findingToNoteRow, IMPORT_SECTIONS, folderAuditFor, notesOwnedBy, linkedElsewhere, shouldStamp, engagementStatus, canonicalImageKey, withImagesPreserved, strictImageResolver, demoteHeadings, sanitizeHtml, sanitizeTitle, resolveFindingLink, htmlToMd,

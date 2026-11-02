@@ -40,7 +40,8 @@ Everything is in the command palette; the status-bar menu (click the `PwnDoc: <e
 | Sync | **Send note to PwnDoc** | Linked note: opens the compare. Otherwise asks for the finding or creates it, links the note, opens the compare |
 | | **Compare with PwnDoc and merge sections** | Side-by-side view per section: Skip, Use PwnDoc, Use note, Merge both |
 | | **Restore from PwnDoc sync history (rollback)** | Restore sections of a past push, pull or merge, on PwnDoc or in the note |
-| | **Lint this note before pushing** | Same checks that run before every push |
+| | **Lint this note before pushing** | Same checks that run before every push, built-in and custom |
+| | **Open (or create) the custom lint rules note** | Your own rules, see below |
 | Engagement | **Engagement dashboard** | Tabs: Notes, No finding yet, Orphans, Only on PwnDoc. Bulk push and pull with a preview |
 | | **Create a new engagement on PwnDoc** | Name, audit type, language, template, dates. Associates the folder |
 | | **Associate folder to PwnDoc engagement** | Subfolders inherit it. Notes get the engagement in their properties |
@@ -66,6 +67,48 @@ Everything is in the command palette; the status-bar menu (click the `PwnDoc: <e
 - **History**: each write stores the finding and the note as they were before, in the plugin folder. It contains client data, do not commit it.
 - **Background check** of the open note against PwnDoc only reads, never prompts for the password, and pauses for 10 minutes after a failure.
 
+## Custom lint rules
+
+Besides the built-in checks you can write your own rules in a vault note (*Open (or create) the custom lint rules note* creates `pwndoc-lint-rules.md` with commented examples, all switched off). The rules are a yaml list in the first yaml block of the note and run wherever the lint runs: before a push, *Lint this note*, bulk push from the dashboard.
+
+```yaml
+# 1. everywhere: a credential in the text is an error
+- id: no-credentials
+  level: error
+  in: note
+  match: '(password|passwd|pwd)\s*[:=]\s*\S+'
+  message: 'Possible credential: {match}'
+
+# 2. only for one client: the folder contains "Generali", then the file name must not contain "Test"
+- id: generali-no-test
+  level: error
+  in: filename
+  match: test
+  message: 'No "Test" in the file name for this client'
+  when:
+    folder: Generali
+
+# 3. a required text: the evidence must show a request, except for mobile notes
+- in: section:evidenza
+  missing: '(GET|POST|PUT|DELETE) /'
+  message: 'Show the request in the evidence'
+  unless:
+    fm:
+      platform: 'Android|iOS'
+```
+
+| Key | Meaning |
+|---|---|
+| `level` | `error` blocks the push, `warn` (default) asks for confirmation |
+| `in` | Where to look, one or a list: `note` (text without frontmatter), `filename`, `title` (file name without `VT-NN - `), `path`, `frontmatter`, `fm:<key>`, `section:<name>` (evidenza, description, remediation...) |
+| `match` | A violation if the text matches |
+| `missing` | A violation if the text does **not** match (a required text). Give exactly one of `match` and `missing` |
+| `message` | What to tell. `{match}` is the text found; for note and section targets the line number is added |
+| `when` / `unless` | Apply the rule only when (or not when) the conditions hold. Keys: `folder`, `file`, `path`, `title`, `engagement` (regex each) and `fm` (a map from frontmatter key to regex). Every key of the block must hold |
+| `id`, `enabled` | Optional label shown in the message; `enabled: false` switches a rule off |
+
+A pattern is a regular expression: plain text is case-insensitive, `/re/flags` is exact. A rule with a mistake (bad regex, unknown key or target) is reported as a lint warning and skipped; the other rules still run. If the note does not exist there are no custom rules.
+
 ## Note format
 
 Sections are matched by heading, in Italian or English. Frontmatter keys written or read by the plugin:
@@ -78,7 +121,7 @@ Sections are matched by heading, in Italian or English. Frontmatter keys written
 | `## Assets` | `scope` | |
 | `## Remediation` | `remediation` | |
 | `## References` | `references` | one per line |
-| `## Custom Fields` | `customFields` | `**label**` blocks |
+| `## Custom Fields` | `customFields` | `**label**` blocks, one per field (OWASP and CWE included), compared field by field |
 | file name after `VT-NN - ` | `title` | |
 | `cvss_vector` | `cvssv3` | CVSS 3.1 |
 | `category` | `vulnType` | |
@@ -99,9 +142,9 @@ Captions: `*Figura X – description*` (IT) or `*Figure X – description*` (EN)
 | History entries per finding | `50` | Older entries are pruned |
 | Warn about changes on PwnDoc | on | Check the open note against PwnDoc |
 | Check interval (minutes) | `5` | `0` = only when a note is opened. Reload the plugin to apply |
+| Custom lint rules note | `pwndoc-lint-rules.md` | Vault note with your lint rules in a yaml block |
 | Mandatory General Information fields | `name,auditType,language,template,company,client,date_start,date_end` | Checked when an export fails |
 | CSV file path, Locale filter, Quick import source and language | | Library import |
-| OWASP and CWE field IDs | | `_id` of the matching PwnDoc custom fields |
 | Default CSV output folder | | Where an API fetch saves `vulnerabilities.csv` |
 | Note templates | | Notes prepended or appended to imported notes |
 | Debug mode | off | Logs to the console, filter by `[PwnDoc 2Sync]` |

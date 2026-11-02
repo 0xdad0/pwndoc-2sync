@@ -1320,3 +1320,118 @@ test('nameTaken ignores case and spacing', () => {
     assert.equal(T.nameTaken([{ name: 'Acme  Web' }], 'acme web'), true);
     assert.equal(T.nameTaken([{ name: 'Acme' }], 'Other'), false);
 });
+
+// ── custom fields: compared field by field ────────────────────────────────────
+const CFC = { cfLabels: { cwe1: 'CWE', owasp1: 'OWASP' }, htmlToMd: html => html.replace(/<[^>]+>/g, '').trim(), normalize: async m => m.trim() };
+const CF_FINDING = { customFields: [
+    { customField: 'cwe1', text: 'CWE-79' },
+    { customField: { _id: 'owasp1' }, text: '<p>A03:2021</p>' },
+    { customField: { _id: 'zzz9' }, text: 'unlabelled' },
+    { customField: 'empty1', text: '' },
+] };
+
+test('renderCustomFields never drops a field whose label is unknown: it shows cf_<id>', () => {
+    assert.match(T.renderCustomFields(CF_FINDING, CFC), /\*\*cf_zzz9\*\*\n\nunlabelled/);
+});
+
+test('compareCustomFields reports each field: same, changed, only in the note, only on PwnDoc (labels match loosely)', () => {
+    const note = '**cwe:**\n\nCWE-79\n\n**Owasp**\n\nA01:2021\n\n**Extra**\n\nonly here';
+    const r = Object.fromEntries(T.compareCustomFields(note, CF_FINDING, CFC).map(f => [f.label, f.status]));
+    assert.deepEqual(r, { cwe: 'same', Owasp: 'changed', Extra: 'note only', cf_zzz9: 'PwnDoc only' });
+});
+
+test('buildComparison: custom fields that exist only on PwnDoc are a visible difference, with the per-field list', async () => {
+    const rows = await T.buildComparison({ ...cmpCtx, ...CFC }, '## Evidenza\n\nx\n', { ...FINDING, customFields: CF_FINDING.customFields }, ['customFields']);
+    assert.equal(rows[0].changed, true);
+    assert.equal(rows[0].localEmpty, true);
+    assert.deepEqual(rows[0].fields.map(f => f.status), ['PwnDoc only', 'PwnDoc only', 'PwnDoc only']);
+});
+
+test('customFieldsPatch matches the note labels loosely', async () => {
+    const ctx = { ...syncCtx(), cfLabels: {} };
+    const patch = await T.customFieldsPatch(ctx, AID, { customFields: CF_REMOTE }, '**cwe :**\n\nCWE-1');
+    assert.equal(patch.find(p => p.customField === 'cf1').text, 'CWE-1');
+});
+
+// ── custom lint rules ─────────────────────────────────────────────────────────
+const rulesOf = list => T.parseLintRules(JSON.stringify(list), JSON.parse);
+const RC = (over = {}) => ({ path: 'Clients/Generali/web/VT-01 - Test login.md', folder: 'Clients/Generali/web', basename: 'VT-01 - Test login', title: 'Test login',
+    fm: { platform: 'WEB', assets: 'INSERT_ASSET', tags: ['a', 'b'], pwndoc_audit: 'Generali 2026' }, md: '---\nplatform: WEB\n---\n## Evidenza\n\nlogin ok\npassword: hunter2\n', engagement: 'Generali 2026', ...over });
+const run = (list, ctx = RC()) => T.runCustomLint(rulesOf(list).rules, ctx);
+
+test('extractRulesText takes the first yaml block of a note, or the whole text', () => {
+    assert.equal(T.extractRulesText('intro\n```yaml\n- a: 1\n```\ntail\n```yaml\n- b\n```'), '- a: 1');
+    assert.equal(T.extractRulesText('- a: 1\n'), '- a: 1\n');
+});
+
+test('parseLintRules accepts a list or { rules }, defaults the level to warn and skips disabled rules', () => {
+    const r = rulesOf({ rules: [{ in: 'note', match: 'x', message: 'm' }, { in: 'note', match: 'y', enabled: false }] });
+    assert.equal(r.rules.length, 1);
+    assert.equal(r.rules[0].level, 'warn');
+    assert.deepEqual(r.errors, []);
+});
+
+test('parseLintRules reports every broken rule and keeps the good ones', () => {
+    const r = rulesOf([
+        { in: 'note', match: '(' }, { in: 'nowhere', match: 'x' }, { match: 'x' }, { in: 'note' }, { in: 'note', match: 'x', missing: 'y' },
+        { in: 'note', match: 'x', level: 'fatal' }, { in: 'note', match: 'x', when: { colour: 'red' } }, { in: 'section:nope', match: 'x' }, { in: 'note', match: 'ok' }]);
+    assert.equal(r.rules.length, 1);
+    assert.equal(r.errors.length, 8);
+    assert.match(r.errors[0], /rule 1.*invalid regex/);
+    assert.match(r.errors[1], /rule 2.*unknown target "nowhere"/);
+    assert.match(r.errors[6], /rule 7.*unknown condition "colour"/);
+    assert.match(r.errors[7], /rule 8.*unknown section "nope"/);
+    assert.match(T.parseLintRules('::: not yaml', () => { throw new Error('bad yaml'); }).errors[0], /bad yaml/);
+});
+
+test('rule for one client: "Test" must not be in the file name when the folder contains Generali', () => {
+    const rule = [{ level: 'error', in: 'filename', match: 'test', message: 'No "Test" in the file name for this client', when: { folder: 'Generali' } }];
+    assert.deepEqual(run(rule).map(i => [i.level, i.section, i.where, i.message]), [['error', 'rule', 'filename', 'No "Test" in the file name for this client']]);
+    assert.deepEqual(run(rule, RC({ folder: 'Clients/Acme', path: 'Clients/Acme/VT-01 - Test login.md' })), []);
+});
+
+test('unless skips the rule, when needs every condition', () => {
+    const base = { in: 'filename', match: 'Test', message: 'm' };
+    assert.equal(run([{ ...base, unless: { folder: 'Generali' } }]).length, 0);
+    assert.equal(run([{ ...base, unless: { folder: 'Acme' } }]).length, 1);
+    assert.equal(run([{ ...base, when: { folder: 'Generali', fm: { platform: 'WEB' } } }]).length, 1);
+    assert.equal(run([{ ...base, when: { folder: 'Generali', fm: { platform: 'Android' } } }]).length, 0);
+    assert.equal(run([{ ...base, when: { engagement: '^Generali' } }]).length, 1);
+    assert.equal(run([{ ...base, when: { file: '^VT-\\d+' } }]).length, 1);
+});
+
+test('a global rule finds text in the note and says the line and the match', () => {
+    const [i] = run([{ in: 'note', match: 'password\\s*:\\s*\\S+', level: 'error', message: 'Credential: {match}' }]);
+    assert.equal(i.message, 'Credential: password: hunter2 (line 4)');
+    assert.equal(i.level, 'error');
+});
+
+test('regex syntax: plain text is case-insensitive, /re/flags is exact', () => {
+    assert.equal(run([{ in: 'filename', match: 'TEST LOGIN' }]).length, 1);
+    assert.equal(run([{ in: 'filename', match: '/TEST LOGIN/' }]).length, 0);
+    assert.equal(run([{ in: 'filename', match: '/TEST LOGIN/i' }]).length, 1);
+});
+
+test('missing: the target must contain the pattern (a missing section counts as empty)', () => {
+    assert.equal(run([{ in: 'filename', missing: '^(VT|M)-\\d{2} - ', message: 'bad name' }]).length, 0);
+    assert.equal(run([{ in: 'filename', missing: '^(VT|M)-\\d{2} - ', message: 'bad name' }], RC({ basename: 'my note' })).length, 1);
+    assert.equal(run([{ in: 'section:evidenza', missing: 'burp', message: 'cite the request' }]).length, 1);
+    assert.equal(run([{ in: 'section:remediation', missing: 'x', message: 'no section' }]).length, 1);
+    assert.equal(run([{ in: 'section:poc', match: 'login ok' }]).length, 1);
+});
+
+test('targets: title, path, fm:<key> (arrays joined), frontmatter, several at once', () => {
+    assert.equal(run([{ in: 'title', match: '^Test' }]).length, 1);
+    assert.equal(run([{ in: 'path', match: 'Generali/web' }]).length, 1);
+    assert.equal(run([{ in: 'fm:assets', match: 'INSERT_ASSET' }]).length, 1);
+    assert.equal(run([{ in: 'fm:tags', match: 'a, b' }]).length, 1);
+    assert.equal(run([{ in: 'fm:cvss_vector', missing: '.', message: 'no vector' }]).length, 1);
+    assert.equal(run([{ in: 'frontmatter', match: 'platform: WEB' }]).length, 1);
+    assert.equal(run([{ in: ['filename', 'title'], match: 'Test' }]).length, 2);
+});
+
+test('lintNote appends the custom rule issues to the built-in ones', () => {
+    const issues = T.lintNote('---\n---\n## Evidenza\n\n', { sections: ['poc'], fm: {}, basename: 'VT-01 - Test', locale: 'IT-it', exists: () => true,
+        rules: rulesOf([{ in: 'filename', match: 'Test', message: 'no test' }]).rules, path: 'a/VT-01 - Test.md', engagement: '' });
+    assert.deepEqual(issues.map(i => `${i.section}:${i.message}`), ['poc:section is empty', 'rule:no test']);
+});
