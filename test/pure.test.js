@@ -1396,8 +1396,8 @@ test('customFieldsPatch matches the note labels loosely', async () => {
 
 // ── custom lint rules ─────────────────────────────────────────────────────────
 const rulesOf = list => T.parseLintRules(JSON.stringify(list), JSON.parse);
-const RC = (over = {}) => ({ path: 'Clients/Generali/web/VT-01 - Test login.md', folder: 'Clients/Generali/web', basename: 'VT-01 - Test login', title: 'Test login',
-    fm: { platform: 'WEB', assets: 'INSERT_ASSET', tags: ['a', 'b'], pwndoc_audit: 'Generali 2026' }, md: '---\nplatform: WEB\n---\n## Evidenza\n\nlogin ok\npassword: hunter2\n', engagement: 'Generali 2026', ...over });
+const RC = (over = {}) => ({ path: 'Clients/ClientA/web/VT-01 - Test login.md', folder: 'Clients/ClientA/web', basename: 'VT-01 - Test login', title: 'Test login',
+    fm: { platform: 'WEB', assets: 'INSERT_ASSET', tags: ['a', 'b'], pwndoc_audit: 'ClientA 2026' }, md: '---\nplatform: WEB\n---\n## Evidenza\n\nlogin ok\npassword: hunter2\n', engagement: 'ClientA 2026', ...over });
 const run = (list, ctx = RC()) => T.runCustomLint(rulesOf(list).rules, ctx);
 
 test('extractRulesText takes the first yaml block of a note, or the whole text', () => {
@@ -1449,13 +1449,13 @@ test('ruleError says what is wrong with one rule, even a disabled one', () => {
 });
 
 const FORM = { id: 'no-test', enabled: true, level: 'error', comment: 'client rule', inText: 'filename, section:evidenza', mode: 'match', pattern: 'test',
-    message: 'No Test', when: { folder: 'Generali', file: '', path: '', title: '', engagement: '', fm: 'platform = WEB\nowner = ^me' }, unless: { folder: '', file: '', path: '', title: '', engagement: '', fm: '' } };
+    message: 'No Test', when: { folder: 'ClientA', file: '', path: '', title: '', engagement: '', fm: 'platform = WEB\nowner = ^me' }, unless: { folder: '', file: '', path: '', title: '', engagement: '', fm: '' } };
 
 test('formToRule writes only what is set, in a readable key order, and ruleToForm reads it back', () => {
     const rule = T.formToRule(FORM);
     assert.deepEqual(Object.keys(rule), ['id', 'level', 'in', 'match', 'message', 'when', 'comment']);
     assert.deepEqual(rule.in, ['filename', 'section:evidenza']);
-    assert.deepEqual(rule.when, { folder: 'Generali', fm: { platform: 'WEB', owner: '^me' } });
+    assert.deepEqual(rule.when, { folder: 'ClientA', fm: { platform: 'WEB', owner: '^me' } });
     assert.deepEqual(T.ruleToForm(rule), FORM);
     assert.equal(T.formToRule({ ...FORM, inText: 'note', enabled: false, mode: 'missing' }).in, 'note');
     assert.equal(T.formToRule({ ...FORM, enabled: false }).enabled, false);
@@ -1474,19 +1474,19 @@ test('writeRulesText replaces only the yaml block of the note and keeps the pros
     assert.deepEqual(T.rulesList(T.writeRulesText('[]', [{ id: 'x' }], JSON_OUT), JSON.parse).list, [{ id: 'x' }]);
 });
 
-test('rule for one client: "Test" must not be in the file name when the folder contains Generali', () => {
-    const rule = [{ level: 'error', in: 'filename', match: 'test', message: 'No "Test" in the file name for this client', when: { folder: 'Generali' } }];
+test('rule for one client: "Test" must not be in the file name when the folder contains ClientA', () => {
+    const rule = [{ level: 'error', in: 'filename', match: 'test', message: 'No "Test" in the file name for this client', when: { folder: 'ClientA' } }];
     assert.deepEqual(run(rule).map(i => [i.level, i.section, i.where, i.message]), [['error', 'rule', 'filename', 'No "Test" in the file name for this client']]);
     assert.deepEqual(run(rule, RC({ folder: 'Clients/Acme', path: 'Clients/Acme/VT-01 - Test login.md' })), []);
 });
 
 test('unless skips the rule, when needs every condition', () => {
     const base = { in: 'filename', match: 'Test', message: 'm' };
-    assert.equal(run([{ ...base, unless: { folder: 'Generali' } }]).length, 0);
+    assert.equal(run([{ ...base, unless: { folder: 'ClientA' } }]).length, 0);
     assert.equal(run([{ ...base, unless: { folder: 'Acme' } }]).length, 1);
-    assert.equal(run([{ ...base, when: { folder: 'Generali', fm: { platform: 'WEB' } } }]).length, 1);
-    assert.equal(run([{ ...base, when: { folder: 'Generali', fm: { platform: 'Android' } } }]).length, 0);
-    assert.equal(run([{ ...base, when: { engagement: '^Generali' } }]).length, 1);
+    assert.equal(run([{ ...base, when: { folder: 'ClientA', fm: { platform: 'WEB' } } }]).length, 1);
+    assert.equal(run([{ ...base, when: { folder: 'ClientA', fm: { platform: 'Android' } } }]).length, 0);
+    assert.equal(run([{ ...base, when: { engagement: '^ClientA' } }]).length, 1);
     assert.equal(run([{ ...base, when: { file: '^VT-\\d+' } }]).length, 1);
 });
 
@@ -1512,7 +1512,7 @@ test('missing: the target must contain the pattern (a missing section counts as 
 
 test('targets: title, path, fm:<key> (arrays joined), frontmatter, several at once', () => {
     assert.equal(run([{ in: 'title', match: '^Test' }]).length, 1);
-    assert.equal(run([{ in: 'path', match: 'Generali/web' }]).length, 1);
+    assert.equal(run([{ in: 'path', match: 'ClientA/web' }]).length, 1);
     assert.equal(run([{ in: 'fm:assets', match: 'INSERT_ASSET' }]).length, 1);
     assert.equal(run([{ in: 'fm:tags', match: 'a, b' }]).length, 1);
     assert.equal(run([{ in: 'fm:cvss_vector', missing: '.', message: 'no vector' }]).length, 1);

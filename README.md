@@ -79,14 +79,14 @@ Besides the built-in checks you can write your own rules in a vault note (*Open 
   match: '(password|passwd|pwd)\s*[:=]\s*\S+'
   message: 'Possible credential: {match}'
 
-# 2. only for one client: the folder contains "Generali", then the file name must not contain "Test"
-- id: generali-no-test
+# 2. only for one client: the folder contains "ClientA", then the file name must not contain "Test"
+- id: clienta-no-test
   level: error
   in: filename
   match: test
   message: 'No "Test" in the file name for this client'
   when:
-    folder: Generali
+    folder: ClientA
 
 # 3. a required text: the evidence must show a request, except for mobile notes
 - in: section:evidenza

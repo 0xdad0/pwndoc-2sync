@@ -1325,14 +1325,14 @@ Edit the yaml block below. The examples are switched off (\`enabled: false\`): t
   match: '(password|passwd|pwd|secret)\\s*[:=]\\s*\\S+'
   message: 'Possible credential in the note: {match}'
 
-- id: generali-no-test-in-name
+- id: clienta-no-test-in-name
   enabled: false
   level: error
   in: filename
   match: test
   message: 'No "Test" in the file name for this client'
   when:
-    folder: Generali
+    folder: ClientA
 
 - id: asset-placeholder
   enabled: false
