@@ -1974,7 +1974,6 @@ class VaultFileSuggestModal extends FuzzySuggestModal {
     onChooseItem(file) { this.onChoose(file.path.replace(/\.md$/, '')); }
 }
 
-// ── Settings tab ──────────────────────────────────────────────────────────────
 // ── Modal: edit one custom lint rule ──────────────────────────────────────────
 // rule: a rule map. onSubmit(rule) gets the new map; nothing is written here. Save stays off while the rule would not compile.
 class RuleModal extends Modal {
@@ -2040,17 +2039,21 @@ class RuleModal extends Modal {
     onClose() { this.contentEl.empty(); }
 }
 
-class PwnDocSettingTab extends PluginSettingTab {
-    constructor(app, plugin) {
-        super(app, plugin);
-        this.plugin = plugin;
-    }
+// ── Modal: custom lint rules editor ───────────────────────────────────────────
+class LintRulesModal extends Modal {
+    constructor(app, plugin) { super(app); this.plugin = plugin; }
+    onOpen() { this.modalEl.style.width = 'min(760px, 95vw)'; this.render(); }
+    onClose() { this.contentEl.empty(); }
 
     // The lint rules of the rules note, one row each: toggle, edit, duplicate, delete. The file stays the source of truth.
-    async renderRules(el) {
-        el.empty();
+    async render() {
         const { exists, list, error } = await this.plugin.readRules();
-        const again = () => this.renderRules(el);
+        const el = this.contentEl;
+        el.empty();
+        el.createEl('h3', { text: 'Lint rules' });
+        new Setting(el).setDesc(this.plugin.settings.lintRulesFile || 'pwndoc-lint-rules.md')
+            .addButton(b => b.setButtonText('Open note').onClick(() => { this.close(); this.plugin.createLintRulesFile(); }));
+        const again = () => this.render();
         if (!exists) {
             new Setting(el).setName('Rules').setDesc('The rules note does not exist yet.')
                 .addButton(b => b.setButtonText('Create with examples').onClick(async () => { await this.plugin.createLintRulesFile(); again(); }));
@@ -2075,6 +2078,14 @@ class PwnDocSettingTab extends PluginSettingTab {
         });
         new Setting(el).addButton(b => b.setButtonText('Add rule').setCta()
             .onClick(() => ask({ level: 'warn', in: 'note', match: '' }, (l, r) => { l.push(r); })));
+    }
+}
+
+// ── Settings tab ──────────────────────────────────────────────────────────────
+class PwnDocSettingTab extends PluginSettingTab {
+    constructor(app, plugin) {
+        super(app, plugin);
+        this.plugin = plugin;
     }
 
     display() {
@@ -2206,14 +2217,11 @@ class PwnDocSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Custom lint rules note')
-            .setDesc('Vault note with the rules in a yaml block, checked with the built-in lint. Not an error if it does not exist.')
+            .setDesc('Vault note with the rules in a yaml block, checked with the built-in lint. Not an error if it does not exist. Edit the rules with the "Edit the custom lint rules" command (Ctrl/Cmd+Shift+L).')
             .addText(t => t
                 .setPlaceholder('pwndoc-lint-rules.md')
                 .setValue(this.plugin.settings.lintRulesFile)
-                .onChange(async v => { this.plugin.settings.lintRulesFile = v.trim(); await this.plugin.saveSettings(); this.renderRules(rulesEl); }))
-            .addButton(b => b.setButtonText('Create / open').onClick(async () => { await this.plugin.createLintRulesFile(); this.renderRules(rulesEl); }));
-        const rulesEl = containerEl.createEl('div');
-        this.renderRules(rulesEl);
+                .onChange(async v => { this.plugin.settings.lintRulesFile = v.trim(); await this.plugin.saveSettings(); }));
 
         new Setting(containerEl)
             .setName('Mandatory General Information fields')
@@ -3137,6 +3145,7 @@ class PwnDocImporterPlugin extends Plugin {
         cmd('send-to-pwndoc', 'Send note to PwnDoc (select or create the finding, then push)', () => this.sendToPwndoc());
         cmd('engagement-dashboard', 'Engagement dashboard (sync status of every note)', () => this.openDashboard());
         cmd('lint-note', 'Lint this note before pushing', () => this.lintCurrentNote());
+        this.addCommand({ id: 'lint-rules-editor', name: 'Edit the custom lint rules', hotkeys: [{ modifiers: ['Mod', 'Shift'], key: 'L' }], callback: () => new LintRulesModal(this.app, this).open() });
         cmd('lint-rules-file', 'Open (or create) the custom lint rules note', () => this.createLintRulesFile());
         cmd('delete-finding', 'Delete this note\'s finding from PwnDoc', () => this.deleteNoteFindingCommand());
         cmd('create-engagement', 'Create a new engagement on PwnDoc', () => this.createEngagement());
@@ -3511,7 +3520,7 @@ class PwnDocImporterPlugin extends Plugin {
         item('Mark finding as completed', 'check-circle', () => this.setCompleted(true));
         item('Reopen finding', 'rotate-ccw', () => this.setCompleted(false));
         item('Lint this note', 'list-checks', () => this.lintCurrentNote());
-        item('Custom lint rules', 'list-filter', () => this.createLintRulesFile());
+        item('Custom lint rules', 'list-filter', () => new LintRulesModal(this.app, this).open());
         item('Unlink from finding', 'unlink', () => this.unlinkNote());
         item('Delete finding from PwnDoc', 'trash-2', () => this.deleteNoteFindingCommand());
         menu.addSeparator();
