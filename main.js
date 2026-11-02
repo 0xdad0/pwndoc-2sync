@@ -398,20 +398,24 @@ function customEntries(finding, ctx) {
     }).filter(e => e.md);
 }
 
-function renderCustomFields(finding, ctx) {
-    return customEntries(finding, ctx).flatMap(c => [`**${c.label}**`, '', c.md, '']).join('\n').trim();
-}
+const cfText = entries => entries.flatMap(c => [`**${c.label}**`, '', c.md, '']).join('\n').trim();
+const renderCustomFields = (finding, ctx) => cfText(customEntries(finding, ctx));
 
 const normLabel = s => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
+const pickLabels = (entries, labels) => entries.filter(e => labels.some(l => normLabel(l) === normLabel(e.label)));
 
 // Field by field: same, changed, only in the note, only on PwnDoc. Labels match ignoring case, spacing and a trailing colon.
-function compareCustomFields(noteText, finding, ctx) {
+// baseText: the custom fields section as of the last sync; a changed field also gets `change` (classify against its own base).
+function compareCustomFields(noteText, finding, ctx, baseText) {
     const remote = customEntries(finding, ctx);
+    const base = baseText === undefined ? undefined : new Map(parseCustomFieldsText(baseText).map(c => [normLabel(c.label), c.md]));
     const used = new Set();
     const out = parseCustomFieldsText(noteText).filter(c => c.md).map(l => {
         const r = remote.find(x => normLabel(x.label) === normLabel(l.label));
         if (r) used.add(r);
-        return { label: l.label, status: !r ? 'note only' : r.md === l.md ? 'same' : 'changed', local: l.md, remote: r?.md ?? '' };
+        const f = { label: l.label, status: !r ? 'note only' : r.md === l.md ? 'same' : 'changed', local: l.md, remote: r?.md ?? '' };
+        if (f.status === 'changed') f.change = classify(base?.get(normLabel(l.label)), l.md, r.md);
+        return f;
     });
     for (const r of remote) if (!used.has(r)) out.push({ label: r.label, status: 'PwnDoc only', local: '', remote: r.md });
     return out;
@@ -447,7 +451,7 @@ async function buildComparison(ctx, noteMd, finding, keys, noteInfo = {}, base =
         const baseText = base?.sections?.[key];
         const status = classify(baseText, local, remote);
         const merge = status === 'conflict' && !def.source ? merge3(baseText, local, remote) : null;
-        const fields = def.kind === 'custom' ? compareCustomFields(localRaw, finding, ctx) : undefined;
+        const fields = def.kind === 'custom' ? compareCustomFields(localRaw, finding, ctx, baseText) : undefined;
         rows.push({ key, local, remote, fields, base: baseText, status, merge, changed: local !== remote, localEmpty: def.cmpLocal ? String(localRaw ?? '').trim() === '' : local === '', remoteEmpty: remote === '', diff: lineDiff(remote, local) });
     }
     return rows;
@@ -567,7 +571,8 @@ async function fetchFinding(ctx, auditId, findingId) {
 
 // ctx: see Plugin.syncCtx. Writes PwnDoc: only the patch of the selected fields (PUT merges), after the
 // state guard, the changed-since-compare check and a history entry. Nothing is written if any step throws.
-async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapshotFinding, force, op = 'push', localBefore = noteMd }) {
+// onlyFields: labels of the custom fields to send; the other custom fields are left as they are on PwnDoc
+async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapshotFinding, force, op = 'push', localBefore = noteMd, onlyFields }) {
     const defs = sections.map(defOf);
     const { audit, finding: fresh } = await fetchFinding(ctx, auditId, findingId);
     assertEditable(audit, force);
@@ -578,12 +583,14 @@ async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapsho
     const baseSections = {};
     for (const def of defs) {
         const text = def.source ? localValue({ ...ctx.noteInfo, md: noteMd }, def) : secs[def.key]?.text || '';
-        const value = await localToRemote(ctx, auditId, def, text, fresh);
+        const picked = def.kind === 'custom' && onlyFields ? pickLabels(parseCustomFieldsText(text), onlyFields).filter(c => c.md) : null;
+        if (picked && !picked.length) continue;
+        const value = await localToRemote(ctx, auditId, def, picked ? cfText(picked) : text, fresh);
         if (value === undefined) continue;
         if (isEmptyValue(value) && !isEmptyValue(fresh[def.field]) && !(await ctx.confirmEmpty(def.key, 'push'))) {
             throw new Error(`local section ${def.key} is empty, refusing to blank it on PwnDoc`);
         }
-        baseSections[def.key] = await comparisonForm(ctx, def, text);
+        baseSections[def.key] = picked ? await partialCustomBase(ctx, picked) : await comparisonForm(ctx, def, text);
         if (def.key === 'title' && text === sanitizeTitle(fresh.title)) continue; // differs only by filename sanitising
         patch[def.field] = value;
     }
@@ -599,7 +606,8 @@ async function pushSections(ctx, { auditId, findingId, noteMd, sections, snapsho
 }
 
 // Local only: returns the new note text, the caller writes it
-async function pullSections(ctx, { auditId, findingId, noteMd, sections }) {
+// onlyFields: labels of the custom fields to bring in; the other blocks of the note are kept. A field is never removed from the note.
+async function pullSections(ctx, { auditId, findingId, noteMd, sections, onlyFields }) {
     const defs = sections.map(defOf);
     const { finding: fresh } = await fetchFinding(ctx, auditId, findingId);
     const secs = parseSections(noteMd);
@@ -610,6 +618,17 @@ async function pullSections(ctx, { auditId, findingId, noteMd, sections }) {
         if (def.source) {
             meta[def.key] = def.cmpRemote ? def.cmpRemote(fresh[def.field]) : String(fresh[def.field] ?? '');
             baseSections[def.key] = def.cmpRemote ? meta[def.key] : def.key === 'title' ? sanitizeTitle(meta[def.key]) : meta[def.key].trim();
+            continue;
+        }
+        if (def.kind === 'custom' && onlyFields) {
+            const incoming = pickLabels(customEntries(fresh, ctx), onlyFields);
+            const cur = parseCustomFieldsText(secs[def.key]?.text || '');
+            for (const e of incoming) {
+                const c = pickLabels(cur, [e.label])[0];
+                if (c) Object.assign(c, { label: e.label, md: e.md }); else cur.push({ label: e.label, md: e.md });
+            }
+            md = replaceSection(md, def.key, cfText(cur));
+            baseSections[def.key] = await partialCustomBase(ctx, incoming);
             continue;
         }
         const remoteEmpty = def.kind === 'custom' ? renderCustomFields(fresh, ctx) === '' : isEmptyValue(fresh[def.field]);
@@ -709,7 +728,18 @@ function parseCustomFieldsText(text) {
 }
 
 // The form renderCustomFields produces, so a note and PwnDoc compare equal when they say the same
-const canonCustom = text => parseCustomFieldsText(text).filter(c => c.md).flatMap(c => [`**${c.label}**`, '', c.md, '']).join('\n').trim();
+const canonCustom = text => cfText(parseCustomFieldsText(text).filter(c => c.md));
+
+// Base of the custom fields section after syncing only `synced` ({ label, md }): the earlier base with those fields updated
+async function partialCustomBase(ctx, synced) {
+    const prev = (await loadBase(ctx.adapter, ctx.historyDir))?.sections?.customFields ?? '';
+    const all = parseCustomFieldsText(prev).filter(c => c.md);
+    for (const s of synced) {
+        const e = pickLabels(all, [s.label])[0];
+        if (e) e.md = s.md; else all.push({ label: s.label, md: s.md });
+    }
+    return cfText(all);
+}
 
 const PLAIN_CF_TYPES = ['input', 'date', 'radio', 'select'];
 
@@ -2214,8 +2244,36 @@ class ConfirmModal extends Modal {
 }
 
 // ── Modal: per-section compare, PwnDoc and note side by side ──────────────────
-// rows: buildComparison() rows. onApply({ push: key[], pull: key[], merge: { [key]: text }, force })
-// Per section the user picks: skip, use the PwnDoc version (pull), use the note version (push) or merge both
+const SYNC_STATUS = { same: 'identical', local: 'changed in the note', remote: 'changed on PwnDoc', conflict: 'changed on both sides', unknown: 'differs (no sync base)' };
+
+// PwnDoc and note columns of a line diff; clicking a column header calls pick('pwndoc' | 'note')
+function diffGrid(parent, diff, locked, pick) {
+    const TINT = { del: 'var(--background-modifier-error)', add: 'var(--background-modifier-success)', none: 'var(--background-secondary)' };
+    const grid = parent.createEl('div');
+    grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:0 8px;margin-top:6px;max-height:280px;overflow:auto;font-family:var(--font-monospace);font-size:0.8em;';
+    const colHead = (text, v) => {
+        const h = grid.createEl('div', { text });
+        h.style.cssText = 'position:sticky;top:0;z-index:1;font-weight:bold;padding:2px 4px;background:var(--background-primary);' + (locked ? '' : 'cursor:pointer;');
+        if (!locked) h.onclick = () => pick(v);
+        return h;
+    };
+    const headL = colHead('PwnDoc', 'pwndoc'), headR = colHead('Note', 'note');
+    for (const r of sideBySide(diff)) {
+        for (const [text, side] of [[r.left, 'left'], [r.right, 'right']]) {
+            const c = grid.createEl('div');
+            c.style.cssText = 'white-space:pre-wrap;word-break:break-word;padding:0 4px;min-height:1.2em;';
+            c.setText(text ?? '');
+            if (text === null) c.style.background = TINT.none;
+            else if (r.kind === 'mod') c.style.background = side === 'left' ? TINT.del : TINT.add;
+            else if (r.kind === 'del' || r.kind === 'add') c.style.background = r.kind === 'del' ? TINT.del : TINT.add;
+        }
+    }
+    return { headL, headR };
+}
+
+// rows: buildComparison() rows. onApply({ push: key[], pull: key[], merge: { [key]: text }, force, cf: { push: label[], pull: label[] } })
+// Per section the user picks: skip, use the PwnDoc version (pull), use the note version (push) or merge both.
+// The custom fields row is the exception: each field has its own choice (cf), no merge.
 class MergeModal extends Modal {
     constructor(app, rows, { defaultKeys, auditState, onApply }) {
         super(app);
@@ -2241,12 +2299,12 @@ class MergeModal extends Modal {
             wrap.createEl('span', { text: ' Enforce write on non-EDIT audit (this operation only)' });
         }
 
-        const STATUS = { same: 'identical', local: 'changed in the note', remote: 'changed on PwnDoc', conflict: 'changed on both sides', unknown: 'differs (no sync base)' };
-        const TINT = { del: 'var(--background-modifier-error)', add: 'var(--background-modifier-success)', none: 'var(--background-secondary)' };
+        const STATUS = SYNC_STATUS;
 
         const ui = this.rows.map(row => {
             const def = SECTION_DEFS.find(d => d.key === row.key);
             const locked = !row.changed;
+            if (row.fields?.length) return { row, locked, fields: this.fieldsBox(contentEl, row, def) };
             let value = locked ? 'skip'
                 : !this.defaultKeys.includes(row.key) ? 'skip'
                 : row.merge ? 'merge' : row.status === 'remote' ? 'pwndoc' : 'note';
@@ -2281,37 +2339,7 @@ class MergeModal extends Modal {
                 btns[k] = b;
             }
 
-            if (row.fields?.length) {
-                const FC = { same: 'var(--text-success)', changed: 'var(--text-warning)', 'note only': 'var(--text-accent)', 'PwnDoc only': 'var(--text-error)' };
-                const fl = box.createEl('div');
-                fl.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-top:6px;';
-                for (const f of row.fields) {
-                    const c = fl.createEl('span', { text: `${f.label}: ${f.status}` });
-                    c.style.cssText = `color:${FC[f.status]};border:1px solid ${FC[f.status]};border-radius:10px;padding:0 8px;font-size:0.78em;`;
-                }
-            }
-            if (row.changed) {
-                const grid = box.createEl('div');
-                grid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:0 8px;margin-top:6px;max-height:280px;overflow:auto;font-family:var(--font-monospace);font-size:0.8em;';
-                const colHead = (text, pick) => {
-                    const h = grid.createEl('div', { text });
-                    h.style.cssText = 'position:sticky;top:0;z-index:1;font-weight:bold;padding:2px 4px;background:var(--background-primary);' + (locked ? '' : 'cursor:pointer;');
-                    if (!locked) h.onclick = () => set(pick);
-                    return h;
-                };
-                headL = colHead('PwnDoc', 'pwndoc');
-                headR = colHead('Note', 'note');
-                for (const r of sideBySide(row.diff)) {
-                    for (const [text, side] of [[r.left, 'left'], [r.right, 'right']]) {
-                        const c = grid.createEl('div');
-                        c.style.cssText = 'white-space:pre-wrap;word-break:break-word;padding:0 4px;min-height:1.2em;';
-                        c.setText(text ?? '');
-                        if (text === null) c.style.background = TINT.none;
-                        else if (r.kind === 'mod') c.style.background = side === 'left' ? TINT.del : TINT.add;
-                        else if (r.kind === 'del' || r.kind === 'add') c.style.background = r.kind === 'del' ? TINT.del : TINT.add;
-                    }
-                }
-            }
+            if (row.changed) ({ headL, headR } = diffGrid(box, row.diff, locked, set));
             if (row.merge) {
                 area = box.createEl('textarea');
                 area.value = row.merge.text;
@@ -2328,17 +2356,19 @@ class MergeModal extends Modal {
 
         const bar = contentEl.createEl('div');
         bar.style.cssText = 'display:flex;gap:8px;margin-top:10px;';
-        const setAll = v => ui.forEach(u => { if (!u.locked) u.set(v); });
+        const setAll = v => ui.forEach(u => { if (u.fields) u.fields.forEach(x => x.set(v)); else if (!u.locked) u.set(v); });
         bar.createEl('button', { text: 'All: PwnDoc' }).onclick = () => setAll('pwndoc');
         bar.createEl('button', { text: 'All: note' }).onclick = () => setAll('note');
         bar.createEl('button', { text: 'None' }).onclick = () => setAll('skip');
         const apply = bar.createEl('button', { text: 'Apply', cls: 'mod-cta' });
         apply.style.marginLeft = 'auto';
         apply.onclick = () => {
-            const keysOf = v => ui.filter(u => u.value() === v).map(u => u.row.key);
+            const keysOf = v => ui.filter(u => (u.fields ? u.fields.some(x => x.value() === v) : u.value() === v)).map(u => u.row.key);
+            const labelsOf = v => ui.flatMap(u => (u.fields || []).filter(x => x.value() === v).map(x => x.f.label));
             const push = keysOf('note');
             const pull = keysOf('pwndoc');
-            const merge = Object.fromEntries(ui.filter(u => u.value() === 'merge').map(u => [u.row.key, u.area.value]));
+            const cf = { push: labelsOf('note'), pull: labelsOf('pwndoc') };
+            const merge = Object.fromEntries(ui.filter(u => !u.fields && u.value() === 'merge').map(u => [u.row.key, u.area.value]));
             if (!push.length && !pull.length && !Object.keys(merge).length) { new Notice('PwnDoc 2Sync: nothing selected.'); return; }
             const bad = Object.entries(merge).find(([, t]) => hasConflictMarkers(t));
             if (bad) { new Notice(`PwnDoc 2Sync: resolve the conflict markers in "${labelOf(defOf(bad[0]))}" first.`); return; }
@@ -2347,8 +2377,51 @@ class MergeModal extends Modal {
                 return;
             }
             this.close();
-            this.onApply({ push, pull, merge, force: !!forceBox?.checked });
+            this.onApply({ push, pull, merge, force: !!forceBox?.checked, cf });
         };
+    }
+
+    // The custom fields row: one block per field with its own Skip / Use PwnDoc / Use note.
+    // A field only in the note can only be sent, one only on PwnDoc can only be brought in (nothing is ever deleted).
+    fieldsBox(contentEl, row, def) {
+        const box = contentEl.createEl('div');
+        box.style.cssText = 'margin-bottom:12px;padding:6px 8px;border:1px solid var(--background-modifier-border);border-radius:6px;';
+        const head = box.createEl('div');
+        head.style.cssText = 'display:flex;align-items:center;gap:10px;';
+        head.createEl('strong', { text: labelOf(def) });
+        head.createEl('small', { text: 'each field on its own', cls: 'pwndoc-meta' });
+        const LABEL = { 'note only': 'only in the note', 'PwnDoc only': 'only on PwnDoc' };
+        const BTN = { skip: 'Skip', pwndoc: 'Use PwnDoc', note: 'Use note' };
+        return row.fields.map(f => {
+            const allowed = f.status === 'same' ? ['skip'] : f.status === 'note only' ? ['skip', 'note'] : f.status === 'PwnDoc only' ? ['skip', 'pwndoc'] : ['skip', 'pwndoc', 'note'];
+            let value = 'skip';
+            if (this.defaultKeys.includes(row.key)) value = f.status === 'PwnDoc only' ? 'pwndoc' : f.status === 'note only' ? 'note' : f.status === 'changed' ? (f.change === 'remote' ? 'pwndoc' : f.change === 'conflict' ? 'skip' : 'note') : 'skip';
+            const item = box.createEl('div');
+            item.style.cssText = 'margin-top:6px;padding-top:6px;border-top:1px solid var(--background-modifier-border);';
+            const h = item.createEl('div');
+            h.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:10px;';
+            h.createEl('strong', { text: f.label });
+            h.createEl('small', { text: f.status === 'changed' ? SYNC_STATUS[f.change] : LABEL[f.status] || SYNC_STATUS.same, cls: 'pwndoc-meta' });
+            const group = h.createEl('div');
+            group.style.cssText = 'margin-left:auto;display:flex;gap:4px;';
+            const btns = {};
+            let headL = null, headR = null;
+            const set = v => {
+                value = v;
+                for (const [k, b] of Object.entries(btns)) b.toggleClass('mod-cta', k === v);
+                if (headL) headL.style.outline = v === 'pwndoc' ? '2px solid var(--interactive-accent)' : '';
+                if (headR) headR.style.outline = v === 'note' ? '2px solid var(--interactive-accent)' : '';
+            };
+            for (const k of allowed) {
+                const b = group.createEl('button', { text: BTN[k] });
+                b.disabled = allowed.length === 1;
+                b.onclick = () => set(k);
+                btns[k] = b;
+            }
+            if (f.status !== 'same') ({ headL, headR } = diffGrid(item, lineDiff(f.remote, f.local), false, v => allowed.includes(v) && set(v)));
+            set(value);
+            return { f, value: () => value, set: v => { if (allowed.includes(v)) set(v); } };
+        });
     }
 
     onClose() { this.contentEl.empty(); }
@@ -3408,7 +3481,7 @@ class PwnDocImporterPlugin extends Plugin {
         new MergeModal(this.app, rows, {
             defaultKeys: DEFAULT_SYNC_SECTIONS,
             auditState: audit.state,
-            onApply: async ({ push, pull, merge, force }) => {
+            onApply: async ({ push, pull, merge, force, cf }) => {
                 try {
                     if (push.length && !(await this.lintGate(file, noteMd, push, audit.language, ctx))) return;
                     if (Object.keys(merge).length) {
@@ -3417,10 +3490,10 @@ class PwnDocImporterPlugin extends Plugin {
                         noteMd = r.noteMd;
                     }
                     if (push.length) {
-                        await pushSections(ctx, { auditId, findingId, noteMd, sections: push, snapshotFinding: finding, force });
+                        await pushSections(ctx, { auditId, findingId, noteMd, sections: push, snapshotFinding: finding, force, onlyFields: cf.push });
                     }
                     if (pull.length) {
-                        const r = await pullSections(ctx, { auditId, findingId, noteMd: await this.app.vault.read(file), sections: pull });
+                        const r = await pullSections(ctx, { auditId, findingId, noteMd: await this.app.vault.read(file), sections: pull, onlyFields: cf.pull });
                         await this.app.vault.modify(file, r.noteMd);
                         await this.applyPullMeta(file, r.meta);
                     }

@@ -1347,6 +1347,47 @@ test('buildComparison: custom fields that exist only on PwnDoc are a visible dif
     assert.deepEqual(rows[0].fields.map(f => f.status), ['PwnDoc only', 'PwnDoc only', 'PwnDoc only']);
 });
 
+test('compareCustomFields classifies each changed field against its own sync base', () => {
+    const note = '**CWE**\n\nCWE-0\n\n**OWASP**\n\nA01:2021';
+    const base = '**CWE**\n\nCWE-0\n\n**OWASP**\n\nA02:2021';
+    const by = (n, b) => Object.fromEntries(T.compareCustomFields(n, CF_FINDING, CFC, b).filter(f => f.status === 'changed').map(f => [f.label, f.change]));
+    assert.deepEqual(by(note, base), { CWE: 'remote', OWASP: 'conflict' });
+    assert.deepEqual(by(note, undefined), { CWE: 'unknown', OWASP: 'unknown' });
+});
+
+const CF_PICK = [
+    { customField: { _id: 'cf1', label: 'CWE', fieldType: 'input' }, text: 'CWE-79' },
+    { customField: { _id: 'cf2', label: 'Note', fieldType: 'text' }, text: '<p>remote note</p>' },
+    { customField: { _id: 'cf4', label: 'Extra', fieldType: 'input' }, text: 'x' },
+];
+const CF_NOTE = '## Custom Fields\n\n**CWE**\n\nlocal-cwe\n\n**Note**\n\nlocal note\n';
+
+test('pushSections with onlyFields sends just the chosen custom fields and records them as synced', async () => {
+    const ctx = syncCtx({ remote: { customFields: clone(CF_REMOTE) } });
+    await T.pushSections(ctx, pushArgs(ctx, { noteMd: '## Custom Fields\n\n**CWE**\n\nCWE-89\n\n**Note**\n\nnew\n', sections: ['customFields'], onlyFields: ['CWE'] }));
+    const sent = ctx.log.puts[0].body.customFields;
+    assert.deepEqual(sent.find(c => c.customField === 'cf1'), { customField: 'cf1', text: 'CWE-89' });
+    assert.deepEqual(sent.find(c => c.customField === 'cf2'), { customField: 'cf2', text: '<p>old</p>' });
+    assert.equal((await T.loadBase(ctx.hist, ctx.historyDir)).sections.customFields, '**CWE**\n\nCWE-89');
+});
+
+test('pullSections with onlyFields rewrites just the chosen blocks, adds PwnDoc-only ones, keeps the rest', async () => {
+    const ctx = syncCtx({ remote: { customFields: clone(CF_PICK) } });
+    const r = await T.pullSections(ctx, { auditId: AID, findingId: FID, noteMd: CF_NOTE, sections: ['customFields'], onlyFields: ['Note', 'Extra'] });
+    assert.deepEqual(T.parseCustomFieldsText(T.parseSections(r.noteMd).customFields.text), [
+        { label: 'CWE', md: 'local-cwe' }, { label: 'Note', md: 'remote note' }, { label: 'Extra', md: 'x' },
+    ]);
+    assert.equal((await T.loadBase(ctx.hist, ctx.historyDir)).sections.customFields, '**Note**\n\nremote note\n\n**Extra**\n\nx');
+});
+
+test('a second partial sync keeps the base of the fields synced before', async () => {
+    const ctx = syncCtx({ remote: { customFields: clone(CF_PICK) } });
+    const args = { auditId: AID, findingId: FID, sections: ['customFields'] };
+    const r = await T.pullSections(ctx, { ...args, noteMd: CF_NOTE, onlyFields: ['Note'] });
+    await T.pullSections(ctx, { ...args, noteMd: r.noteMd, onlyFields: ['CWE'] });
+    assert.equal((await T.loadBase(ctx.hist, ctx.historyDir)).sections.customFields, '**Note**\n\nremote note\n\n**CWE**\n\nCWE-79');
+});
+
 test('customFieldsPatch matches the note labels loosely', async () => {
     const ctx = { ...syncCtx(), cfLabels: {} };
     const patch = await T.customFieldsPatch(ctx, AID, { customFields: CF_REMOTE }, '**cwe :**\n\nCWE-1');

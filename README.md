@@ -121,7 +121,7 @@ Sections are matched by heading, in Italian or English. Frontmatter keys written
 | `## Assets` | `scope` | |
 | `## Remediation` | `remediation` | |
 | `## References` | `references` | one per line |
-| `## Custom Fields` | `customFields` | `**label**` blocks, one per field (OWASP and CWE included), compared field by field |
+| `## Custom Fields` | `customFields` | `**label**` blocks, one per field (OWASP and CWE included), compared field by field, each with its own Skip / Use PwnDoc / Use note |
 | file name after `VT-NN - ` | `title` | |
 | `cvss_vector` | `cvssv3` | CVSS 3.1 |
 | `category` | `vulnType` | |
